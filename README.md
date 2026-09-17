@@ -8,4 +8,6 @@
 
 | [cs-002](https://github.com/lizyyy/feedback/tree/cs-002) | CS-002 | 内部 Sphinx 分支：docmill 增量缓存跨进程失效排查 | sphinx-doc/sphinx main 2026-09-17 快照 + 自撰 docmill/（含上游 builders/html 一处补丁） | BSD-2-Clause |
 
+| [cs-003](https://github.com/lizyyy/feedback/tree/cs-003) | CS-003 | 内部 zarr 分支：chunkforge 折叠后读到错版本数据 | zarr-developers/zarr-python main 2026-09-17 快照 + 自撰 chunkforge/（上游一行未改） | MIT |
+
 取用：`git clone --depth 1 --branch cs-001 https://github.com/lizyyy/feedback.git`
