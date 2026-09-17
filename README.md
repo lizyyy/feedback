@@ -6,4 +6,6 @@
 |---|---|---|---|---|
 | [cs-001](https://github.com/lizyyy/feedback/tree/cs-001) | CS-001 v1.1.0 | 内部 Scrapy 分支：dpipe 超时解析接口迁移复核 | scrapy/scrapy main 2026-09-17 快照 + 自撰 dpipe/（含上游 downloadtimeout.py / retry.py 两处补丁） | BSD-3-Clause |
 
+| [cs-002](https://github.com/lizyyy/feedback/tree/cs-002) | CS-002 | 内部 Sphinx 分支：docmill 增量缓存跨进程失效排查 | sphinx-doc/sphinx main 2026-09-17 快照 + 自撰 docmill/（含上游 builders/html 一处补丁） | BSD-2-Clause |
+
 取用：`git clone --depth 1 --branch cs-001 https://github.com/lizyyy/feedback.git`
