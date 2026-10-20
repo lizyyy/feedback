@@ -1,0 +1,240 @@
+# Contributing
+
+Thank you for contributing to skfolio. Contributions of all sizes are welcome,
+including bug reports, feature proposals, documentation improvements, tests, and
+code changes.
+
+By participating in the project, you agree to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Ways to contribute
+
+- Report reproducible bugs through [GitHub issues][gh-issues].
+- Propose improvements or new features.
+- Improve the documentation, docstrings, or tutorials.
+- Fix open issues.
+- Add tests or improve existing test coverage.
+
+Please report security vulnerabilities according to our
+[Security Policy](SECURITY.md), rather than opening a public issue.
+
+For substantial changes, consider opening an issue first. This gives maintainers and
+contributors an opportunity to discuss the scope and approach before implementation.
+
+### Report a bug
+
+A useful bug report includes:
+
+- Your operating system and Python version.
+- Relevant details about your environment.
+- A minimal reproducible example.
+- The observed behavior and the expected behavior.
+- The complete error message or traceback, when applicable.
+
+### Propose a feature
+
+A useful feature proposal:
+
+- Explains the problem or use case.
+- Describes the expected behavior.
+- Keeps the initial scope as narrow as practical.
+- Mentions alternatives or prior approaches when relevant.
+
+## Development setup
+
+Local development requires Python 3.10 or later and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+1. Fork the repository on GitHub and clone your fork:
+
+   ```shell
+   git clone git@github.com:your-name/skfolio.git
+   cd skfolio
+   ```
+
+2. Install the development environment and Git commit hook:
+
+   ```shell
+   uv sync
+   uv run pre-commit install
+   ```
+
+   If a hook modifies files, stage them and commit again.
+
+   `uv sync` creates `.venv` and installs skfolio in editable mode, including the
+   default `dev` dependency group.
+
+3. Create a branch for your changes:
+
+   ```shell
+   git checkout -b name-of-your-bugfix-or-feature
+   ```
+
+   A recommended branch name is
+   `category/reference/description-in-kebab-case`, where `category` is one of
+   `feature`, `fix`, `refactor`, or `chore`, and `reference` is an issue such as
+   `issue-34` or `no-ref`. For example:
+   `feature/issue-34/factor-model`.
+
+## Tests and code quality
+
+Add tests for new behavior and bug fixes. While developing, you can run a focused
+test file:
+
+```shell
+uv run pytest tests/path/to/test_file.py
+```
+
+Before you open a pull request, run the complete test suite, which includes the
+docstring examples, and check that imports in `src` match the dependencies declared
+in `pyproject.toml`:
+
+```shell
+uv run pytest
+uv run deptry src
+```
+
+Format and lint your changes with:
+
+```shell
+uv run ruff check --fix
+uv run ruff format
+```
+
+The commit hook runs the same Ruff commands on staged files, type checks `src` with
+ty, checks that every module, class and function in `src` has a docstring, and checks
+YAML syntax and file endings. To run it on all files, as CI does, use `uv run pre-commit run --all-files`.
+
+Type check `src` with [ty](https://docs.astral.sh/ty/). Warnings also fail the check:
+
+```shell
+uv run ty check
+```
+
+Fix diagnostics that reveal a bug or a wrong annotation. When ty cannot follow code
+that is already correct, add a `# ty: ignore[<rule>]` comment on the reported line
+rather than adding checks or restructuring the code only to satisfy the checker.
+Unused ignore comments also fail the check.
+
+### Dependency versions
+
+skfolio is a library that supports the dependency versions allowed by
+`pyproject.toml`, so `uv.lock` is not committed. CI tests this range, from the
+minimum supported versions to the latest releases, lints with the latest Ruff
+release and type checks with the latest ty release. ty is in beta, so a new ty
+release can report diagnostics on code that has not changed.
+
+`uv sync` keeps the versions recorded in your local `uv.lock`. If CI reports a
+failure that you cannot reproduce locally, update your environment to the latest
+allowed versions:
+
+```shell
+uv sync --upgrade
+```
+
+Add `--group docs` or `--group notebooks` if you use those tools.
+
+## Documentation
+
+If your change affects the documentation, install the documentation dependencies:
+
+```shell
+uv sync --group docs
+cd docs
+```
+
+For a fast build without executing the tutorials, as run by CI:
+
+```shell
+SKFOLIO_DOCS_FAST=1 uv run sphinx-build -b html . _build
+```
+
+Fast mode also skips the JupyterLite site and the sphinx-llm Markdown build. In
+PowerShell, run `$env:SKFOLIO_DOCS_FAST = "1"` before the build and
+`Remove-Item Env:SKFOLIO_DOCS_FAST` after it.
+
+To execute a single tutorial, replace the filename in `filename_pattern`:
+
+```shell
+uv run sphinx-build -b html -D 'sphinx_gallery_conf.filename_pattern=plot_characteristics_factor_model\.py$' -D sphinx_gallery_conf.run_stale_examples=True . _build
+```
+
+To execute the complete gallery locally when needed:
+
+```shell
+uv run sphinx-build -b html . _build
+```
+
+The complete gallery can take about 30 minutes and is also executed by the
+documentation deployment workflow.
+
+Sphinx-Gallery generates `docs/auto_examples` and `docs/_contents`.
+Edit the source tutorials under `examples` rather than editing these generated files.
+
+### Docstrings
+
+Every module, class and function in `src` has a docstring, including private helpers
+and nested functions. Dunder methods are exempt, and `__init__` parameters are
+documented in the class docstring. Public classes, functions and methods use the
+numpydoc sections, such as `Parameters` and `Returns`. A one-line summary is enough
+for private helpers.
+
+To list missing docstrings across `src`:
+
+```shell
+uv run pre-commit run numpydoc-validation --all-files
+```
+
+### Docstring examples
+
+Examples in public docstrings are run as doctests. They provide a basic check
+that the documented workflow works, but do not replace tests in `tests/`.
+
+Keep examples simple and readable. Avoid code written only to satisfy doctest.
+Put exact numerical checks, edge cases, and regression tests in `tests/`.
+
+## Submit your changes
+
+Commit your changes using a message that follows
+[Conventional Commits](https://www.conventionalcommits.org):
+
+Use `type(scope): description`, where the scope is optional. Common types are:
+
+- `feat`: New functionality.
+- `fix`: Bug fix.
+- `docs`: Documentation changes.
+- `test`: Test changes.
+- `refactor`: Code changes that preserve behavior.
+- `perf`: Performance improvements.
+- `build`: Packaging or dependency changes.
+- `ci`: Continuous integration changes.
+- `chore`: Repository maintenance.
+
+Add `!` for a breaking change, for example
+`feat!: remove deprecated parameter`.
+
+```shell
+git add .
+git commit -m "feat(scope): describe your change"
+git push origin name-of-your-bugfix-or-feature
+```
+
+Open a pull request through GitHub, or use the GitHub CLI:
+
+```shell
+gh pr create --fill
+```
+
+Use the same format for the pull request title. It becomes the commit message when
+the pull request is squash-merged.
+
+Draft pull requests are welcome and are a good place to discuss work in progress.
+Before requesting a review:
+
+- Include tests for feature changes and bug fixes.
+- Update the documentation when behavior or public APIs change.
+- Keep the pull request focused on one coherent change.
+- Confirm that the [tests and code quality checks](#tests-and-code-quality) pass.
+- Ensure that continuous integration passes.
+
+[gh-issues]: https://github.com/skfolio/skfolio/issues

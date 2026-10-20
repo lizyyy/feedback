@@ -1,0 +1,3113 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+import scipy.optimize as sco
+from sklearn import config_context
+from sklearn.covariance import OAS as SklearnOAS
+from sklearn.covariance import EmpiricalCovariance as SklearnEmpiricalCovariance
+from sklearn.covariance import LedoitWolf as SklearnLedoitWolf
+from sklearn.covariance import ShrunkCovariance as SklearnShrunkCovariance
+from sklearn.model_selection import cross_val_score
+
+from skfolio.exceptions import NonPositiveVarianceError
+from skfolio.moments import (
+    OAS,
+    BaseCovariance,
+    DenoiseCovariance,
+    DetoneCovariance,
+    EWCovariance,
+    EmpiricalCovariance,
+    GeodesicShrinkageCovariance,
+    GeodesicShrinkageTarget,
+    GerberCovariance,
+    GraphicalLassoCV,
+    ImpliedCovariance,
+    LedoitWolf,
+    ShrunkCovariance,
+)
+from skfolio.moments.covariance import _denoise_covariance
+from skfolio.moments.covariance._base import _reduce_to_finite_active_block
+from skfolio.moments.covariance._geodesic_shrinkage_covariance import (
+    _geodesic_interpolation,
+)
+from skfolio.typing import FloatArray
+from skfolio.utils.stats import (
+    _squared_mahalanobis_dist_from_cholesky,
+    safe_cholesky,
+)
+
+
+def _manual_observed_subspace_score(
+    X: FloatArray,
+    covariance: FloatArray,
+    mean: FloatArray | None,
+) -> float:
+    row_scores = []
+    for row in X:
+        mask = np.isfinite(row)
+        if not np.any(mask):
+            continue
+
+        chol = safe_cholesky(covariance[np.ix_(mask, mask)])
+        d2 = _squared_mahalanobis_dist_from_cholesky(
+            row[mask],
+            cholesky=chol,
+            mean=None if mean is None else mean[mask],
+        )
+        logdet = 2.0 * np.sum(np.log(np.diag(chol)))
+        row_scores.append(0.5 * (-logdet - d2 - mask.sum() * np.log(2.0 * np.pi)))
+
+    if not row_scores:
+        raise ValueError("No valid row score")
+    return float(np.mean(row_scores))
+
+
+class _MinimalCovariance(BaseCovariance):
+    """Concrete subclass for testing :meth:`BaseCovariance._set_covariance`."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def fit(self, X, y=None, **fit_params):
+        return self
+
+
+class TestSetCovarianceActiveBlock:
+    """`_set_covariance` peels incomplete active blocks and warns."""
+
+    def test_warns_and_peels_when_active_block_has_nan(self):
+        cov = np.array(
+            [
+                [1e-4, np.nan, 0.0],
+                [np.nan, 1e-4, 0.0],
+                [0.0, 0.0, 1e-4],
+            ],
+            dtype=float,
+        )
+        est = _MinimalCovariance(nearest=False)
+        with pytest.warns(UserWarning, match="Peeling"):
+            est._set_covariance(cov.copy())
+        assert np.all(np.isnan(est.covariance_[0, :]))
+        assert np.all(np.isnan(est.covariance_[:, 0]))
+        sub = est.covariance_[np.ix_([1, 2], [1, 2])]
+        assert np.all(np.isfinite(sub))
+
+    def test_no_raise_when_no_finite_diagonal(self):
+        cov = np.full((2, 2), np.nan, dtype=float)
+        est = _MinimalCovariance(nearest=False)
+        est._set_covariance(cov)
+        assert np.all(np.isnan(est.covariance_))
+
+    def test_no_raise_when_active_block_is_dense(self):
+        cov = np.full((3, 3), np.nan, dtype=float)
+        cov[1, 1] = cov[2, 2] = 1e-4
+        cov[1, 2] = cov[2, 1] = 1e-5
+        est = _MinimalCovariance(nearest=False)
+        est._set_covariance(cov)
+        np.testing.assert_allclose(est.covariance_, cov)
+
+
+class TestReduceToFiniteActiveBlock:
+    """Unit tests for :func:`_reduce_to_finite_active_block`."""
+
+    def test_tie_breaks_on_smallest_index(self):
+        cov = np.array(
+            [[1e-4, np.nan], [np.nan, 1e-4]],
+            dtype=float,
+        )
+        _reduce_to_finite_active_block(cov)
+        assert np.all(np.isnan(cov[0, :])) and np.all(np.isnan(cov[:, 0]))
+        assert np.isfinite(cov[1, 1])
+
+    def test_no_op_when_already_dense(self):
+        cov = np.eye(3, dtype=float) * 1e-4
+        expected = cov.copy()
+        _reduce_to_finite_active_block(cov)
+        np.testing.assert_allclose(cov, expected)
+
+
+class TestBaseCovarianceMethods:
+    """Test base class methods (mahalanobis, score) across all covariance estimators."""
+
+    @pytest.fixture
+    def estimators(self):
+        """Return a list of covariance estimators to test."""
+        return [
+            EmpiricalCovariance(),
+            EWCovariance(half_life=23),
+            LedoitWolf(),
+            OAS(),
+            ShrunkCovariance(),
+        ]
+
+    def test_mahalanobis_basic(self, X):
+        """Test mahalanobis returns correct shape and positive values."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        # Test with full dataset
+        distances = model.mahalanobis(X)
+        assert distances.shape == (len(X),)
+        assert np.all(distances >= 0)
+        assert np.all(np.isfinite(distances))
+
+    @pytest.mark.parametrize(
+        "estimator_class",
+        [EmpiricalCovariance, LedoitWolf, OAS, ShrunkCovariance, GraphicalLassoCV],
+    )
+    @pytest.mark.parametrize("single_observation", [False, True])
+    def test_mahalanobis_input_keywords(self, estimator_class, single_observation):
+        X = np.random.default_rng(0).normal(size=(100, 3))
+        model = estimator_class().fit(X)
+        X_test = X[0] if single_observation else X[:5]
+        expected = model.mahalanobis(X_test)
+
+        np.testing.assert_array_equal(model.mahalanobis(X=X_test), expected)
+        with pytest.warns(FutureWarning, match="`X_test` is deprecated"):
+            distances = model.mahalanobis(X_test=X_test)
+        np.testing.assert_array_equal(distances, expected)
+
+    def test_mahalanobis_conflicting_input_keywords(self):
+        X = np.random.default_rng(0).normal(size=(30, 3))
+        model = EmpiricalCovariance().fit(X)
+        with pytest.raises(ValueError, match="pass only `X`"):
+            model.mahalanobis(X=X, X_test=X)
+
+    def test_mahalanobis_missing_input(self):
+        model = EmpiricalCovariance().fit(np.random.default_rng(0).normal(size=(30, 3)))
+        with pytest.raises(TypeError, match="`X`"):
+            model.mahalanobis()
+
+    def test_mahalanobis_single_observation(self, X):
+        """Test mahalanobis with a single observation returns scalar."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        # Single observation with preserved feature names
+        single_obs = X.iloc[[0]]
+        distance = model.mahalanobis(single_obs)
+        assert np.isscalar(distance) or distance.shape in [(), (1,)]
+        assert distance >= 0
+        assert np.isfinite(distance)
+
+    def test_mahalanobis_validates_feature_names(self, X):
+        """Test mahalanobis rejects reordered feature names like score does."""
+        model = EmpiricalCovariance(nearest=False)
+        model.fit(X)
+
+        reordered = X[X.columns[::-1]]
+        with pytest.raises(ValueError, match="feature names"):
+            model.mahalanobis(X=reordered)
+
+    def test_mahalanobis_chi_squared_distribution(self, X):
+        """Test that mahalanobis distances follow chi-squared distribution."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        distances = model.mahalanobis(X)
+        n_assets = X.shape[1]
+
+        # Under Gaussian assumption, squared Mahalanobis distances should have
+        # mean approximately equal to n_assets (chi-squared with n_assets DoF)
+        # Allow some tolerance due to finite sample
+        assert n_assets * 0.5 < distances.mean() < n_assets * 1.5
+
+    def test_mahalanobis_outlier_detection(self):
+        """Test that mahalanobis can detect outliers."""
+        rng = np.random.default_rng(42)
+        n_assets = 5
+        n_obs = 200
+
+        # Generate normal data
+        X_normal = rng.standard_normal((n_obs, n_assets)) * 0.01
+
+        # Add outliers (last 5 observations)
+        X_outliers = rng.standard_normal((5, n_assets)) * 0.05  # 5x volatility
+        np.vstack([X_normal, X_outliers])
+
+        model = EmpiricalCovariance()
+        model.fit(X_normal)  # Fit only on normal data
+
+        distances_normal = model.mahalanobis(X_normal)
+        distances_outliers = model.mahalanobis(X_outliers)
+
+        # Outliers should have larger distances on average
+        assert distances_outliers.mean() > distances_normal.mean()
+
+    @pytest.mark.parametrize(
+        "estimator_class",
+        [
+            EmpiricalCovariance,
+            EWCovariance,
+            LedoitWolf,
+            OAS,
+            ShrunkCovariance,
+            GeodesicShrinkageCovariance,
+        ],
+    )
+    def test_mahalanobis_across_estimators(self, X, estimator_class):
+        """Test mahalanobis works across all estimator types."""
+        if estimator_class == EWCovariance:
+            model = estimator_class(half_life=23)
+        else:
+            model = estimator_class()
+
+        model.fit(X)
+        distances = model.mahalanobis(X)
+
+        assert distances.shape == (len(X),)
+        assert np.all(distances >= 0)
+        assert np.all(np.isfinite(distances))
+
+    def test_score_basic(self, X):
+        """Test score returns a finite float."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        score = model.score(X)
+        assert isinstance(score, float)
+        assert np.isfinite(score)
+
+    def test_score_handles_missing_rows_on_observed_subspaces(self):
+        """Test score uses row-wise observed subspaces when X_test contains NaN."""
+        rng = np.random.default_rng(123)
+        X_train = rng.standard_normal((80, 4)) * 0.01
+        X_test = rng.standard_normal((6, 4)) * 0.01
+        X_test[0, 1] = np.nan
+        X_test[1, [0, 3]] = np.nan
+        X_test[2, 2] = np.nan
+
+        model = EmpiricalCovariance(nearest=False)
+        model.fit(X_train)
+
+        score = model.score(X_test)
+        expected = _manual_observed_subspace_score(
+            X_test,
+            model.covariance_,
+            model.location_,
+        )
+        np.testing.assert_allclose(score, expected, rtol=1e-10)
+
+    def test_score_ignores_rows_with_no_finite_retained_observation(self):
+        """Test score ignores rows that are fully missing in the retained subspace."""
+        rng = np.random.default_rng(123)
+        X_train = rng.standard_normal((80, 3)) * 0.01
+        X_test = rng.standard_normal((5, 3)) * 0.01
+        X_test[0, :] = np.nan
+
+        model = EmpiricalCovariance(nearest=False)
+        model.fit(X_train)
+
+        score = model.score(X_test)
+        expected = _manual_observed_subspace_score(
+            X_test,
+            model.covariance_,
+            model.location_,
+        )
+        np.testing.assert_allclose(score, expected, rtol=1e-10)
+
+    def test_score_model_comparison(self, X):
+        """Test using score for model comparison."""
+        # Split data
+        X_train = X.iloc[:200]
+        X_test = X.iloc[200:]
+
+        # Fit different models
+        emp = EmpiricalCovariance().fit(X_train)
+        lw = LedoitWolf().fit(X_train)
+
+        # Get scores on test data
+        score_emp = emp.score(X_test)
+        score_lw = lw.score(X_test)
+
+        # Both should be finite
+        assert np.isfinite(score_emp)
+        assert np.isfinite(score_lw)
+
+        # LedoitWolf often performs better on out-of-sample data
+        # (shrinkage helps with estimation error)
+        # We don't assert which is better, just that comparison is possible
+
+    @pytest.mark.parametrize(
+        "estimator_class",
+        [
+            EmpiricalCovariance,
+            EWCovariance,
+            LedoitWolf,
+            OAS,
+            ShrunkCovariance,
+            GeodesicShrinkageCovariance,
+        ],
+    )
+    def test_score_across_estimators(self, X, estimator_class):
+        """Test score works across all estimator types."""
+        if estimator_class == EWCovariance:
+            model = estimator_class(half_life=23)
+        else:
+            model = estimator_class()
+
+        model.fit(X)
+        score = model.score(X)
+
+        assert isinstance(score, float)
+        assert np.isfinite(score)
+
+    def test_score_sklearn_cross_validation(self):
+        """Test that score is compatible with sklearn cross-validation."""
+        rng = np.random.default_rng(42)
+        X = rng.standard_normal((200, 5)) * 0.01
+
+        model = EmpiricalCovariance()
+        scores = cross_val_score(model, X, cv=3)
+
+        assert len(scores) == 3
+        assert all(np.isfinite(s) for s in scores)
+
+    def test_mahalanobis_with_held_out_data(self, X):
+        """Test mahalanobis on held-out data."""
+        X_train = X.iloc[:200]
+        X_test = X.iloc[200:]
+
+        model = EmpiricalCovariance()
+        model.fit(X_train)
+
+        distances_train = model.mahalanobis(X_train)
+        distances_test = model.mahalanobis(X_test)
+
+        # Both should be valid
+        assert np.all(distances_train >= 0)
+        assert np.all(distances_test >= 0)
+        assert np.all(np.isfinite(distances_train))
+        assert np.all(np.isfinite(distances_test))
+
+    def test_score_with_different_data_sizes(self):
+        """Test score with different observation counts."""
+        rng = np.random.default_rng(42)
+        n_assets = 5
+
+        X_train = rng.standard_normal((100, n_assets)) * 0.01
+
+        model = EmpiricalCovariance()
+        model.fit(X_train)
+
+        # Test with different sizes
+        for n_test in [10, 50, 100, 200]:
+            X_test = rng.standard_normal((n_test, n_assets)) * 0.01
+            score = model.score(X_test)
+            assert np.isfinite(score)
+
+    def test_mahalanobis_numerical_stability(self):
+        """Test mahalanobis with near-singular covariance."""
+        rng = np.random.default_rng(42)
+        n_assets = 5
+        n_obs = 100
+
+        # Create highly correlated data (near-singular covariance)
+        common_factor = rng.standard_normal(n_obs) * 0.01
+        idiosyncratic = rng.standard_normal((n_obs, n_assets)) * 0.0001
+        X = np.column_stack([common_factor for _ in range(n_assets)]) + idiosyncratic
+
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        # Should handle near-singular case with regularization
+        distances = model.mahalanobis(X)
+        assert np.all(np.isfinite(distances))
+        assert np.all(distances >= 0)
+
+    def test_score_numerical_stability(self):
+        """Test score with near-singular covariance."""
+        rng = np.random.default_rng(42)
+        n_assets = 5
+        n_obs = 100
+
+        # Create highly correlated data
+        common_factor = rng.standard_normal(n_obs) * 0.01
+        idiosyncratic = rng.standard_normal((n_obs, n_assets)) * 0.0001
+        X = np.column_stack([common_factor for _ in range(n_assets)]) + idiosyncratic
+
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        score = model.score(X)
+        assert np.isfinite(score)
+
+    def test_mahalanobis_exact_values(self, X):
+        """Test mahalanobis returns expected values."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        distances = model.mahalanobis(X)
+
+        # Test first few values for regression testing
+        np.testing.assert_almost_equal(
+            distances[:5],
+            [8.7574, 13.4907, 19.4821, 12.6576, 10.3059],
+            decimal=3,
+        )
+
+    def test_score_exact_values(self, X):
+        """Test score returns expected values."""
+        model = EmpiricalCovariance()
+        model.fit(X)
+
+        score = model.score(X)
+        np.testing.assert_almost_equal(score, 58.5851, decimal=3)
+
+    def test_mahalanobis_ewcovariance_exact_values(self, X):
+        """Test mahalanobis with EWCovariance returns expected values."""
+        # half_life = -ln(2)/ln(0.97) ≈ 22.7566 gives decay_factor = 0.97
+        model = EWCovariance(half_life=-np.log(2) / np.log(0.97))
+        model.fit(X)
+
+        distances = model.mahalanobis(X)
+
+        np.testing.assert_almost_equal(
+            distances[:5],
+            [11.99974801, 26.86418476, 47.18668954, 19.60064144, 16.60156827],
+            decimal=4,
+        )
+
+    def test_score_ewcovariance_exact_values(self, X):
+        """Test score with EWCovariance returns expected values."""
+        # half_life = -ln(2)/ln(0.97) ≈ 22.7566 gives decay_factor = 0.97
+        model = EWCovariance(half_life=-np.log(2) / np.log(0.97))
+        model.fit(X)
+
+        score = model.score(X)
+        np.testing.assert_almost_equal(score, 53.5791, decimal=3)
+
+
+class TestSklearnComparison:
+    """Compare skfolio EmpiricalCovariance with sklearn's implementation.
+
+    Note: skfolio uses ddof=1 by default (unbiased estimator) while sklearn uses
+    ddof=0 (MLE). For exact matching, we set skfolio's ddof=0.
+    """
+
+    def test_covariance_matches_sklearn(self, X):
+        """Test that skfolio covariance matches sklearn's covariance."""
+        # skfolio uses nearest=True and ddof=1 by default, so set ddof=0 for fair comparison
+        skfolio_model = EmpiricalCovariance(nearest=False, ddof=0)
+        sklearn_model = SklearnEmpiricalCovariance()
+
+        skfolio_model.fit(X)
+        sklearn_model.fit(X)
+
+        np.testing.assert_allclose(
+            skfolio_model.covariance_,
+            sklearn_model.covariance_,
+            rtol=1e-10,
+        )
+
+    def test_mahalanobis_matches_sklearn(self, X):
+        """Test that skfolio mahalanobis matches sklearn's mahalanobis."""
+        skfolio_model = EmpiricalCovariance(nearest=False, ddof=0)
+        sklearn_model = SklearnEmpiricalCovariance()
+
+        skfolio_model.fit(X)
+        sklearn_model.fit(X)
+
+        skfolio_distances = skfolio_model.mahalanobis(X)
+        sklearn_distances = sklearn_model.mahalanobis(X)
+
+        np.testing.assert_allclose(
+            skfolio_distances,
+            sklearn_distances,
+            rtol=1e-8,
+        )
+
+    def test_score_matches_sklearn(self, X):
+        """Test that skfolio score matches sklearn's score."""
+        skfolio_model = EmpiricalCovariance(nearest=False, ddof=0)
+        sklearn_model = SklearnEmpiricalCovariance()
+
+        skfolio_model.fit(X)
+        sklearn_model.fit(X)
+
+        skfolio_score = skfolio_model.score(X)
+        sklearn_score = sklearn_model.score(X)
+
+        np.testing.assert_allclose(
+            skfolio_score,
+            sklearn_score,
+            rtol=1e-8,
+        )
+
+    def test_mahalanobis_on_held_out_data_matches_sklearn(self, X):
+        """Test mahalanobis on held-out data matches sklearn."""
+        X_train = X.iloc[:200]
+        X_test = X.iloc[200:]
+
+        skfolio_model = EmpiricalCovariance(nearest=False, ddof=0)
+        sklearn_model = SklearnEmpiricalCovariance()
+
+        skfolio_model.fit(X_train)
+        sklearn_model.fit(X_train)
+
+        skfolio_distances = skfolio_model.mahalanobis(X_test)
+        sklearn_distances = sklearn_model.mahalanobis(X_test)
+
+        np.testing.assert_allclose(
+            skfolio_distances,
+            sklearn_distances,
+            rtol=1e-8,
+        )
+
+    def test_score_on_held_out_data_matches_sklearn(self, X):
+        """Test score on held-out data matches sklearn."""
+        X_train = X.iloc[:200]
+        X_test = X.iloc[200:]
+
+        skfolio_model = EmpiricalCovariance(nearest=False, ddof=0)
+        sklearn_model = SklearnEmpiricalCovariance()
+
+        skfolio_model.fit(X_train)
+        sklearn_model.fit(X_train)
+
+        skfolio_score = skfolio_model.score(X_test)
+        sklearn_score = sklearn_model.score(X_test)
+
+        np.testing.assert_allclose(
+            skfolio_score,
+            sklearn_score,
+            rtol=1e-8,
+        )
+
+    @pytest.mark.parametrize("assume_centered", [False, True])
+    @pytest.mark.parametrize(
+        ("skfolio_factory", "sklearn_factory"),
+        [
+            (
+                lambda assume_centered: EmpiricalCovariance(
+                    assume_centered=assume_centered, nearest=False, ddof=0
+                ),
+                lambda assume_centered: SklearnEmpiricalCovariance(
+                    assume_centered=assume_centered
+                ),
+            ),
+            (
+                lambda assume_centered: LedoitWolf(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnLedoitWolf(
+                    assume_centered=assume_centered
+                ),
+            ),
+            (
+                lambda assume_centered: OAS(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnOAS(assume_centered=assume_centered),
+            ),
+            (
+                lambda assume_centered: ShrunkCovariance(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnShrunkCovariance(
+                    assume_centered=assume_centered
+                ),
+            ),
+        ],
+        ids=["empirical", "ledoit_wolf", "oas", "shrunk_covariance"],
+    )
+    def test_assume_centered_score_matches_sklearn(
+        self, X, assume_centered, skfolio_factory, sklearn_factory
+    ):
+        """Test score stays aligned with sklearn for both centering modes."""
+        skfolio_model = skfolio_factory(assume_centered)
+        sklearn_model = sklearn_factory(assume_centered)
+
+        skfolio_model.fit(X)
+        sklearn_model.fit(X)
+
+        np.testing.assert_allclose(
+            skfolio_model.score(X),
+            sklearn_model.score(X),
+            rtol=1e-8,
+        )
+
+    @pytest.mark.parametrize("assume_centered", [False, True])
+    @pytest.mark.parametrize(
+        ("skfolio_factory", "sklearn_factory"),
+        [
+            (
+                lambda assume_centered: EmpiricalCovariance(
+                    assume_centered=assume_centered, nearest=False, ddof=0
+                ),
+                lambda assume_centered: SklearnEmpiricalCovariance(
+                    assume_centered=assume_centered
+                ),
+            ),
+            (
+                lambda assume_centered: LedoitWolf(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnLedoitWolf(
+                    assume_centered=assume_centered
+                ),
+            ),
+            (
+                lambda assume_centered: OAS(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnOAS(assume_centered=assume_centered),
+            ),
+            (
+                lambda assume_centered: ShrunkCovariance(
+                    assume_centered=assume_centered, nearest=False
+                ),
+                lambda assume_centered: SklearnShrunkCovariance(
+                    assume_centered=assume_centered
+                ),
+            ),
+        ],
+        ids=["empirical", "ledoit_wolf", "oas", "shrunk_covariance"],
+    )
+    def test_assume_centered_mahalanobis_matches_sklearn(
+        self, X, assume_centered, skfolio_factory, sklearn_factory
+    ):
+        """Test mahalanobis stays aligned with sklearn for both centering modes."""
+        skfolio_model = skfolio_factory(assume_centered)
+        sklearn_model = sklearn_factory(assume_centered)
+
+        skfolio_model.fit(X)
+        sklearn_model.fit(X)
+
+        np.testing.assert_allclose(
+            skfolio_model.mahalanobis(X),
+            sklearn_model.mahalanobis(X),
+            rtol=1e-8,
+        )
+
+    def test_assume_centered_mahalanobis_validates_feature_names(self):
+        """Test mahalanobis validates dataframe column order under inference."""
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame(rng.standard_normal((40, 3)), columns=["a", "b", "c"])
+        model = LedoitWolf(assume_centered=True, nearest=False)
+        model.fit(X)
+
+        with pytest.raises(ValueError, match="feature names"):
+            model.mahalanobis(X[["c", "b", "a"]])
+
+
+class TestEmpiricalCovariance:
+    def test_empirical_covariance(self, X):
+        model = EmpiricalCovariance()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        np.testing.assert_almost_equal(model.covariance_, np.cov(X.T))
+
+    @pytest.mark.parametrize("higham", [False, True])
+    def test_nearest_repairs_rank_deficient_returns(self, higham):
+        X = np.random.default_rng(10).standard_normal((4, 6)) * 0.01
+        unmodified = X.copy()
+        raw_covariance = EmpiricalCovariance(nearest=False).fit(X).covariance_
+
+        with pytest.warns(UserWarning, match="not positive definite"):
+            model = EmpiricalCovariance(higham=higham).fit(X)
+
+        np.linalg.cholesky(model.covariance_)
+        assert np.linalg.eigh(model.covariance_)[0][0] > 0
+        np.testing.assert_array_equal(
+            np.diag(model.covariance_), np.diag(raw_covariance)
+        )
+        np.testing.assert_array_equal(X, unmodified)
+
+    def test_invalid_ddof(self):
+        """Invalid ddof values raise ValueError."""
+        X = np.random.randn(5, 3)
+
+        with pytest.raises(ValueError, match="ddof must be a non-negative integer"):
+            EmpiricalCovariance(ddof=-1).fit(X)
+
+        with pytest.raises(ValueError, match="ddof must be a non-negative integer"):
+            EmpiricalCovariance(ddof=1.5).fit(X)
+
+        with pytest.raises(
+            ValueError,
+            match="ddof must be strictly less than the number of observations",
+        ):
+            EmpiricalCovariance(ddof=5).fit(X)
+
+
+class TestDenoiseCovariance:
+    def test_denoise_covariance(self, X):
+        model = DenoiseCovariance()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        np.testing.assert_almost_equal(
+            model.covariance_,
+            np.array(
+                [
+                    [
+                        3.36851928e-04,
+                        2.96226518e-04,
+                        1.50198062e-04,
+                        2.08290279e-04,
+                        1.13739162e-04,
+                        1.38929029e-04,
+                        1.47089690e-04,
+                        7.63976356e-05,
+                        1.34906888e-04,
+                        8.64503154e-05,
+                        9.29280085e-05,
+                        7.67552391e-05,
+                        1.65072711e-04,
+                        9.53629027e-05,
+                        8.42142515e-05,
+                        8.83014182e-05,
+                        1.44224568e-04,
+                        1.30072416e-04,
+                        9.89320074e-05,
+                        9.61903058e-05,
+                    ],
+                    [
+                        2.96226518e-04,
+                        1.39232325e-03,
+                        2.45579004e-04,
+                        3.78063001e-04,
+                        1.74523560e-04,
+                        2.24557031e-04,
+                        2.38326670e-04,
+                        8.35514734e-05,
+                        2.15161188e-04,
+                        1.09349052e-04,
+                        9.07126468e-05,
+                        7.45648626e-05,
+                        2.66929104e-04,
+                        1.23357760e-04,
+                        8.78744674e-05,
+                        1.10222956e-04,
+                        2.66202857e-04,
+                        1.82112331e-04,
+                        1.38048025e-04,
+                        1.45256569e-04,
+                    ],
+                    [
+                        1.50198062e-04,
+                        2.45579004e-04,
+                        3.92897019e-04,
+                        1.98280999e-04,
+                        2.07537628e-04,
+                        2.24324617e-04,
+                        1.34888015e-04,
+                        8.13929343e-05,
+                        1.95397249e-04,
+                        9.24523024e-05,
+                        9.80095757e-05,
+                        9.29191060e-05,
+                        1.44936128e-04,
+                        8.42082871e-05,
+                        9.86673480e-05,
+                        7.52104134e-05,
+                        3.22814750e-04,
+                        1.41321754e-04,
+                        7.25487908e-05,
+                        1.87824173e-04,
+                    ],
+                    [
+                        2.08290279e-04,
+                        3.78063001e-04,
+                        1.98280999e-04,
+                        6.15226996e-04,
+                        1.54649017e-04,
+                        1.87036328e-04,
+                        1.72009700e-04,
+                        7.23972102e-05,
+                        1.74444085e-04,
+                        8.93159085e-05,
+                        8.24215017e-05,
+                        7.09663079e-05,
+                        1.91124114e-04,
+                        9.53176738e-05,
+                        8.00129317e-05,
+                        8.55781295e-05,
+                        2.33538344e-04,
+                        1.43628436e-04,
+                        1.00058528e-04,
+                        1.32788276e-04,
+                    ],
+                    [
+                        1.13739162e-04,
+                        1.74523560e-04,
+                        2.07537628e-04,
+                        1.54649017e-04,
+                        3.60718475e-04,
+                        2.14761143e-04,
+                        1.07228293e-04,
+                        7.46064948e-05,
+                        1.82701776e-04,
+                        8.27526143e-05,
+                        9.11192671e-05,
+                        8.93139759e-05,
+                        1.12874045e-04,
+                        7.01009825e-05,
+                        9.33018975e-05,
+                        6.22398836e-05,
+                        3.23536060e-04,
+                        1.24634396e-04,
+                        5.39791606e-05,
+                        1.88167725e-04,
+                    ],
+                    [
+                        1.38929029e-04,
+                        2.24557031e-04,
+                        2.24324617e-04,
+                        1.87036328e-04,
+                        2.14761143e-04,
+                        4.82677024e-04,
+                        1.26723573e-04,
+                        7.92424146e-05,
+                        1.97256707e-04,
+                        8.98357948e-05,
+                        9.54331535e-05,
+                        9.23483364e-05,
+                        1.34946289e-04,
+                        7.89749328e-05,
+                        9.75220775e-05,
+                        7.00680866e-05,
+                        3.39016709e-04,
+                        1.37401444e-04,
+                        6.50436667e-05,
+                        1.95565165e-04,
+                    ],
+                    [
+                        1.47089690e-04,
+                        2.38326670e-04,
+                        1.34888015e-04,
+                        1.72009700e-04,
+                        1.07228293e-04,
+                        1.26723573e-04,
+                        2.35179319e-04,
+                        7.32368606e-05,
+                        1.21784694e-04,
+                        8.03593204e-05,
+                        9.08794930e-05,
+                        7.60678095e-05,
+                        1.40971650e-04,
+                        8.67740463e-05,
+                        8.21603963e-05,
+                        8.08178271e-05,
+                        1.32957686e-04,
+                        1.18063033e-04,
+                        8.71253231e-05,
+                        9.20552524e-05,
+                    ],
+                    [
+                        7.63976356e-05,
+                        8.35514734e-05,
+                        8.13929343e-05,
+                        7.23972102e-05,
+                        7.46064948e-05,
+                        7.92424146e-05,
+                        7.32368606e-05,
+                        1.30933719e-04,
+                        7.70031820e-05,
+                        6.86121671e-05,
+                        9.48000690e-05,
+                        7.97760291e-05,
+                        8.19725634e-05,
+                        7.17586448e-05,
+                        8.24150242e-05,
+                        6.93287520e-05,
+                        6.50828795e-05,
+                        8.95686733e-05,
+                        6.50183655e-05,
+                        6.61664443e-05,
+                    ],
+                    [
+                        1.34906888e-04,
+                        2.15161188e-04,
+                        1.95397249e-04,
+                        1.74444085e-04,
+                        1.82701776e-04,
+                        1.97256707e-04,
+                        1.21784694e-04,
+                        7.70031820e-05,
+                        3.01178283e-04,
+                        8.59083308e-05,
+                        9.39448182e-05,
+                        8.77779583e-05,
+                        1.31266299e-04,
+                        7.94129568e-05,
+                        9.29019368e-05,
+                        7.16021816e-05,
+                        2.77624522e-04,
+                        1.29328282e-04,
+                        6.87910672e-05,
+                        1.65188245e-04,
+                    ],
+                    [
+                        8.64503154e-05,
+                        1.09349052e-04,
+                        9.24523024e-05,
+                        8.93159085e-05,
+                        8.27526143e-05,
+                        8.98357948e-05,
+                        8.03593204e-05,
+                        6.86121671e-05,
+                        8.59083308e-05,
+                        1.34130222e-04,
+                        9.01792425e-05,
+                        7.63895291e-05,
+                        8.96167327e-05,
+                        7.12248755e-05,
+                        7.95423176e-05,
+                        6.80773836e-05,
+                        8.50794113e-05,
+                        9.21523583e-05,
+                        6.54830927e-05,
+                        7.31809234e-05,
+                    ],
+                    [
+                        9.29280085e-05,
+                        9.07126468e-05,
+                        9.80095757e-05,
+                        8.24215017e-05,
+                        9.11192671e-05,
+                        9.54331535e-05,
+                        9.08794930e-05,
+                        9.48000690e-05,
+                        9.39448182e-05,
+                        9.01792425e-05,
+                        2.79158697e-04,
+                        1.07124182e-04,
+                        1.02013599e-04,
+                        9.46677231e-05,
+                        1.10215732e-04,
+                        9.20305342e-05,
+                        6.91080362e-05,
+                        1.15540879e-04,
+                        8.51865138e-05,
+                        8.09055448e-05,
+                    ],
+                    [
+                        7.67552391e-05,
+                        7.45648626e-05,
+                        9.29191060e-05,
+                        7.09663079e-05,
+                        8.93139759e-05,
+                        9.23483364e-05,
+                        7.60678095e-05,
+                        7.97760291e-05,
+                        8.77779583e-05,
+                        7.63895291e-05,
+                        1.07124182e-04,
+                        1.86622434e-04,
+                        8.45436625e-05,
+                        7.80208736e-05,
+                        9.37666936e-05,
+                        7.54451764e-05,
+                        8.32224749e-05,
+                        9.88130858e-05,
+                        6.83903510e-05,
+                        8.02772266e-05,
+                    ],
+                    [
+                        1.65072711e-04,
+                        2.66929104e-04,
+                        1.44936128e-04,
+                        1.91124114e-04,
+                        1.12874045e-04,
+                        1.34946289e-04,
+                        1.40971650e-04,
+                        8.19725634e-05,
+                        1.31266299e-04,
+                        8.96167327e-05,
+                        1.02013599e-04,
+                        8.45436625e-05,
+                        2.95295468e-04,
+                        9.79660267e-05,
+                        9.14132252e-05,
+                        9.15146301e-05,
+                        1.34612401e-04,
+                        1.31135041e-04,
+                        9.92336805e-05,
+                        9.61695044e-05,
+                    ],
+                    [
+                        9.53629027e-05,
+                        1.23357760e-04,
+                        8.42082871e-05,
+                        9.53176738e-05,
+                        7.01009825e-05,
+                        7.89749328e-05,
+                        8.67740463e-05,
+                        7.17586448e-05,
+                        7.94129568e-05,
+                        7.12248755e-05,
+                        9.46677231e-05,
+                        7.80208736e-05,
+                        9.79660267e-05,
+                        1.38626742e-04,
+                        8.16352365e-05,
+                        7.44027005e-05,
+                        5.66039607e-05,
+                        9.52503995e-05,
+                        7.39684821e-05,
+                        6.04340756e-05,
+                    ],
+                    [
+                        8.42142515e-05,
+                        8.78744674e-05,
+                        9.86673480e-05,
+                        8.00129317e-05,
+                        9.33018975e-05,
+                        9.75220775e-05,
+                        8.21603963e-05,
+                        8.24150242e-05,
+                        9.29019368e-05,
+                        7.95423176e-05,
+                        1.10215732e-04,
+                        9.37666936e-05,
+                        9.14132252e-05,
+                        8.16352365e-05,
+                        2.01688838e-04,
+                        7.87627130e-05,
+                        8.84370778e-05,
+                        1.03743907e-04,
+                        7.23425334e-05,
+                        8.35502351e-05,
+                    ],
+                    [
+                        8.83014182e-05,
+                        1.10222956e-04,
+                        7.52104134e-05,
+                        8.55781295e-05,
+                        6.22398836e-05,
+                        7.00680866e-05,
+                        8.08178271e-05,
+                        6.93287520e-05,
+                        7.16021816e-05,
+                        6.80773836e-05,
+                        9.20305342e-05,
+                        7.54451764e-05,
+                        9.15146301e-05,
+                        7.44027005e-05,
+                        7.87627130e-05,
+                        1.36865583e-04,
+                        4.34369257e-05,
+                        8.99807179e-05,
+                        7.11604921e-05,
+                        5.34284074e-05,
+                    ],
+                    [
+                        1.44224568e-04,
+                        2.66202857e-04,
+                        3.22814750e-04,
+                        2.33538344e-04,
+                        3.23536060e-04,
+                        3.39016709e-04,
+                        1.32957686e-04,
+                        6.50828795e-05,
+                        2.77624522e-04,
+                        8.50794113e-05,
+                        6.91080362e-05,
+                        8.32224749e-05,
+                        1.34612401e-04,
+                        5.66039607e-05,
+                        8.84370778e-05,
+                        4.34369257e-05,
+                        1.46834330e-03,
+                        1.45571274e-04,
+                        3.33006208e-05,
+                        2.99086016e-04,
+                    ],
+                    [
+                        1.30072416e-04,
+                        1.82112331e-04,
+                        1.41321754e-04,
+                        1.43628436e-04,
+                        1.24634396e-04,
+                        1.37401444e-04,
+                        1.18063033e-04,
+                        8.95686733e-05,
+                        1.29328282e-04,
+                        9.21523583e-05,
+                        1.15540879e-04,
+                        9.88130858e-05,
+                        1.31135041e-04,
+                        9.52503995e-05,
+                        1.03743907e-04,
+                        8.99807179e-05,
+                        1.45571274e-04,
+                        2.64503039e-04,
+                        8.85871195e-05,
+                        1.10117345e-04,
+                    ],
+                    [
+                        9.89320074e-05,
+                        1.38048025e-04,
+                        7.25487908e-05,
+                        1.00058528e-04,
+                        5.39791606e-05,
+                        6.50436667e-05,
+                        8.71253231e-05,
+                        6.50183655e-05,
+                        6.87910672e-05,
+                        6.54830927e-05,
+                        8.51865138e-05,
+                        6.83903510e-05,
+                        9.92336805e-05,
+                        7.39684821e-05,
+                        7.23425334e-05,
+                        7.11604921e-05,
+                        3.33006208e-05,
+                        8.85871195e-05,
+                        1.79815850e-04,
+                        4.46914915e-05,
+                    ],
+                    [
+                        9.61903058e-05,
+                        1.45256569e-04,
+                        1.87824173e-04,
+                        1.32788276e-04,
+                        1.88167725e-04,
+                        1.95565165e-04,
+                        9.20552524e-05,
+                        6.61664443e-05,
+                        1.65188245e-04,
+                        7.31809234e-05,
+                        8.09055448e-05,
+                        8.02772266e-05,
+                        9.61695044e-05,
+                        6.04340756e-05,
+                        8.35502351e-05,
+                        5.34284074e-05,
+                        2.99086016e-04,
+                        1.10117345e-04,
+                        4.46914915e-05,
+                        3.08618732e-04,
+                    ],
+                ]
+            ),
+        )
+
+    def test_metadata_routing(self, X, implied_vol):
+        with config_context(enable_metadata_routing=True):
+            model = DenoiseCovariance(
+                covariance_estimator=ImpliedCovariance().set_fit_request(
+                    implied_vol=True
+                )
+            )
+
+            with pytest.raises(ValueError, match="`implied_vol` cannot be None"):
+                model.fit(X)
+
+            model.fit(X, implied_vol=implied_vol)
+
+        assert model.covariance_estimator_.r2_scores_.shape == (20,)
+        assert model.covariance_.shape == (20, 20)
+
+    def test_marchenko_pastur_variance(self, monkeypatch):
+        # Each asset has factor variance 0.5 and noise variance 1, so the noise
+        # carries 2/3 of the variance of every asset.
+        rng = np.random.default_rng(0)
+        n_observations, n_assets, n_factors = 2000, 200, 10
+        loadings = rng.normal(size=(n_assets, n_factors))
+        loadings *= np.sqrt(0.5) / np.linalg.norm(loadings, axis=1, keepdims=True)
+        X = rng.normal(size=(n_observations, n_factors)) @ loadings.T + rng.normal(
+            size=(n_observations, n_assets)
+        )
+
+        fitted_variances = []
+
+        def minimize(*args, **kwargs):
+            res = sco.minimize(*args, **kwargs)
+            fitted_variances.append(res["x"][0])
+            return res
+
+        monkeypatch.setattr(
+            _denoise_covariance, "sco", SimpleNamespace(minimize=minimize)
+        )
+        DenoiseCovariance().fit(X)
+        np.testing.assert_allclose(fitted_variances, [2 / 3], atol=0.02)
+
+
+class TestDetoneCovariance:
+    @pytest.mark.filterwarnings("ignore:The covariance matrix is not positive definite")
+    def test_detone_covariance(self, X):
+        model = DetoneCovariance(covariance_estimator=DenoiseCovariance())
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        np.testing.assert_almost_equal(
+            model.covariance_,
+            np.array(
+                [
+                    [
+                        3.36851928e-04,
+                        1.22239534e-04,
+                        -2.51729943e-05,
+                        6.40304437e-05,
+                        -5.43665457e-05,
+                        -3.92490108e-05,
+                        3.07729776e-05,
+                        -3.12917840e-05,
+                        -2.57022161e-05,
+                        -2.28902372e-05,
+                        -4.61126564e-05,
+                        -4.69319678e-05,
+                        3.81450580e-05,
+                        -8.41760137e-06,
+                        -4.44218474e-05,
+                        -1.00452471e-05,
+                        -6.29373981e-05,
+                        -1.94435159e-05,
+                        7.51170890e-06,
+                        -5.49722926e-05,
+                    ],
+                    [
+                        1.22239534e-04,
+                        1.39232325e-03,
+                        3.94800954e-06,
+                        1.77135063e-04,
+                        -6.04254036e-05,
+                        -2.30678956e-05,
+                        7.19231331e-05,
+                        -8.59011703e-05,
+                        -8.08965599e-06,
+                        -5.93683128e-05,
+                        -1.25612847e-04,
+                        -1.17383553e-04,
+                        8.39797816e-05,
+                        -3.95334870e-05,
+                        -1.11422525e-04,
+                        -4.43197160e-05,
+                        -1.47383909e-05,
+                        -4.21406248e-05,
+                        -2.46312269e-06,
+                        -6.61050102e-05,
+                    ],
+                    [
+                        -2.51729943e-05,
+                        3.94800954e-06,
+                        3.92897019e-04,
+                        1.35967345e-05,
+                        7.72347637e-05,
+                        7.14886200e-05,
+                        -2.45905134e-05,
+                        -4.57502111e-05,
+                        5.40771180e-05,
+                        -3.68147789e-05,
+                        -6.58630830e-05,
+                        -4.38333435e-05,
+                        -3.48438408e-05,
+                        -5.52640492e-05,
+                        -4.55760900e-05,
+                        -5.69132845e-05,
+                        1.67081908e-04,
+                        -3.36571751e-05,
+                        -5.75028524e-05,
+                        7.30665182e-05,
+                    ],
+                    [
+                        6.40304437e-05,
+                        1.77135063e-04,
+                        1.35967345e-05,
+                        6.15226996e-04,
+                        -2.17902572e-05,
+                        -1.71606749e-06,
+                        3.51314020e-05,
+                        -5.97700875e-05,
+                        3.85378371e-06,
+                        -4.28626999e-05,
+                        -8.70525642e-05,
+                        -7.77986753e-05,
+                        3.99732962e-05,
+                        -3.48472491e-05,
+                        -7.47966925e-05,
+                        -3.78642120e-05,
+                        2.12907197e-05,
+                        -3.29669876e-05,
+                        -1.38484438e-05,
+                        -2.56695263e-05,
+                    ],
+                    [
+                        -5.43665457e-05,
+                        -6.04254036e-05,
+                        7.72347637e-05,
+                        -2.17902572e-05,
+                        3.60718475e-04,
+                        8.56857478e-05,
+                        -4.31633197e-05,
+                        -3.38777628e-05,
+                        6.25403180e-05,
+                        -2.92958584e-05,
+                        -4.81446455e-05,
+                        -2.50007039e-05,
+                        -5.73210843e-05,
+                        -5.44389997e-05,
+                        -2.82099848e-05,
+                        -5.52203646e-05,
+                        1.92355811e-04,
+                        -2.93230714e-05,
+                        -6.44919191e-05,
+                        9.63357501e-05,
+                    ],
+                    [
+                        -3.92490108e-05,
+                        -2.30678956e-05,
+                        7.14886200e-05,
+                        -1.71606749e-06,
+                        8.56857478e-05,
+                        4.82677024e-04,
+                        -3.45274644e-05,
+                        -4.39379623e-05,
+                        5.62129045e-05,
+                        -3.65134296e-05,
+                        -6.24728514e-05,
+                        -3.92971503e-05,
+                        -4.67494624e-05,
+                        -5.81188486e-05,
+                        -4.17290158e-05,
+                        -5.92555776e-05,
+                        1.79228420e-04,
+                        -3.51283361e-05,
+                        -6.29126384e-05,
+                        8.19963262e-05,
+                    ],
+                    [
+                        3.07729776e-05,
+                        7.19231331e-05,
+                        -2.45905134e-05,
+                        3.51314020e-05,
+                        -4.31633197e-05,
+                        -3.45274644e-05,
+                        2.35179319e-04,
+                        -2.13242649e-05,
+                        -2.38024898e-05,
+                        -1.67810018e-05,
+                        -3.13668085e-05,
+                        -3.22039735e-05,
+                        2.17449166e-05,
+                        -6.10970962e-06,
+                        -3.08047055e-05,
+                        -7.01285772e-06,
+                        -5.53994219e-05,
+                        -1.65212276e-05,
+                        3.94602035e-06,
+                        -4.28817059e-05,
+                    ],
+                    [
+                        -3.12917840e-05,
+                        -8.59011703e-05,
+                        -4.57502111e-05,
+                        -5.97700875e-05,
+                        -3.38777628e-05,
+                        -4.39379623e-05,
+                        -2.13242649e-05,
+                        1.30933719e-04,
+                        -3.64571612e-05,
+                        9.56463625e-06,
+                        2.87804456e-05,
+                        2.21358976e-05,
+                        -2.13389466e-05,
+                        1.40624942e-05,
+                        2.04775615e-05,
+                        1.59391348e-05,
+                        -8.34376829e-05,
+                        -1.85094324e-06,
+                        6.98892234e-06,
+                        -2.93823005e-05,
+                    ],
+                    [
+                        -2.57022161e-05,
+                        -8.08965599e-06,
+                        5.40771180e-05,
+                        3.85378371e-06,
+                        6.25403180e-05,
+                        5.62129045e-05,
+                        -2.38024898e-05,
+                        -3.64571612e-05,
+                        3.01178283e-04,
+                        -3.00951769e-05,
+                        -5.24470402e-05,
+                        -3.43843711e-05,
+                        -3.26315812e-05,
+                        -4.54309924e-05,
+                        -3.61009839e-05,
+                        -4.66241183e-05,
+                        1.33345492e-04,
+                        -2.88047318e-05,
+                        -4.84167784e-05,
+                        5.95052975e-05,
+                    ],
+                    [
+                        -2.28902372e-05,
+                        -5.93683128e-05,
+                        -3.68147789e-05,
+                        -4.28626999e-05,
+                        -2.92958584e-05,
+                        -3.65134296e-05,
+                        -1.67810018e-05,
+                        9.56463625e-06,
+                        -3.00951769e-05,
+                        1.34130222e-04,
+                        1.44175319e-05,
+                        1.02969768e-05,
+                        -1.67633981e-05,
+                        6.75021457e-06,
+                        9.03577257e-06,
+                        8.08938690e-06,
+                        -6.54926892e-05,
+                        -6.36915085e-06,
+                        2.46107865e-06,
+                        -2.58083144e-05,
+                    ],
+                    [
+                        -4.61126564e-05,
+                        -1.25612847e-04,
+                        -6.58630830e-05,
+                        -8.70525642e-05,
+                        -4.81446455e-05,
+                        -6.24728514e-05,
+                        -3.13668085e-05,
+                        2.87804456e-05,
+                        -5.24470402e-05,
+                        1.44175319e-05,
+                        2.79158697e-04,
+                        3.31287044e-05,
+                        -3.15174078e-05,
+                        2.04813636e-05,
+                        3.07365146e-05,
+                        2.33433184e-05,
+                        -1.18756276e-04,
+                        -1.96869455e-06,
+                        1.04162725e-05,
+                        -4.15805671e-05,
+                    ],
+                    [
+                        -4.69319678e-05,
+                        -1.17383553e-04,
+                        -4.38333435e-05,
+                        -7.77986753e-05,
+                        -2.50007039e-05,
+                        -3.92971503e-05,
+                        -3.22039735e-05,
+                        2.21358976e-05,
+                        -3.43843711e-05,
+                        1.02969768e-05,
+                        3.31287044e-05,
+                        1.86622434e-04,
+                        -3.43159667e-05,
+                        1.16405319e-05,
+                        2.51981293e-05,
+                        1.39835112e-05,
+                        -7.24910665e-05,
+                        -3.33153611e-06,
+                        1.18759135e-06,
+                        -1.99801411e-05,
+                    ],
+                    [
+                        3.81450580e-05,
+                        8.39797816e-05,
+                        -3.48438408e-05,
+                        3.99732962e-05,
+                        -5.73210843e-05,
+                        -4.67494624e-05,
+                        2.17449166e-05,
+                        -2.13389466e-05,
+                        -3.26315812e-05,
+                        -1.67633981e-05,
+                        -3.15174078e-05,
+                        -3.43159667e-05,
+                        2.95295468e-04,
+                        -2.65653518e-06,
+                        -3.25363612e-05,
+                        -3.58266934e-06,
+                        -7.93252454e-05,
+                        -1.67827839e-05,
+                        9.32366908e-06,
+                        -5.66293897e-05,
+                    ],
+                    [
+                        -8.41760137e-06,
+                        -3.95334870e-05,
+                        -5.52640492e-05,
+                        -3.48472491e-05,
+                        -5.44389997e-05,
+                        -5.81188486e-05,
+                        -6.10970962e-06,
+                        1.40624942e-05,
+                        -4.54309924e-05,
+                        6.75021457e-06,
+                        2.04813636e-05,
+                        1.16405319e-05,
+                        -2.65653518e-06,
+                        1.38626742e-04,
+                        1.11585081e-05,
+                        1.85174888e-05,
+                        -1.11488724e-04,
+                        -2.45434795e-06,
+                        1.57977325e-05,
+                        -5.02422150e-05,
+                    ],
+                    [
+                        -4.44218474e-05,
+                        -1.11422525e-04,
+                        -4.55760900e-05,
+                        -7.47966925e-05,
+                        -2.82099848e-05,
+                        -4.17290158e-05,
+                        -3.08047055e-05,
+                        2.04775615e-05,
+                        -3.61009839e-05,
+                        9.03577257e-06,
+                        3.07365146e-05,
+                        2.51981293e-05,
+                        -3.25363612e-05,
+                        1.11585081e-05,
+                        2.01688838e-04,
+                        1.34432264e-05,
+                        -7.63501717e-05,
+                        -4.49766645e-06,
+                        1.56850630e-06,
+                        -2.31770766e-05,
+                    ],
+                    [
+                        -1.00452471e-05,
+                        -4.43197160e-05,
+                        -5.69132845e-05,
+                        -3.78642120e-05,
+                        -5.52203646e-05,
+                        -5.92555776e-05,
+                        -7.01285772e-06,
+                        1.59391348e-05,
+                        -4.66241183e-05,
+                        8.08938690e-06,
+                        2.33433184e-05,
+                        1.39835112e-05,
+                        -3.58266934e-06,
+                        1.85174888e-05,
+                        1.34432264e-05,
+                        1.36865583e-04,
+                        -1.14314370e-04,
+                        -1.47277391e-06,
+                        1.67644461e-05,
+                        -5.08160573e-05,
+                    ],
+                    [
+                        -6.29373981e-05,
+                        -1.47383909e-05,
+                        1.67081908e-04,
+                        2.12907197e-05,
+                        1.92355811e-04,
+                        1.79228420e-04,
+                        -5.53994219e-05,
+                        -8.34376829e-05,
+                        1.33345492e-04,
+                        -6.54926892e-05,
+                        -1.18756276e-04,
+                        -7.24910665e-05,
+                        -7.93252454e-05,
+                        -1.11488724e-04,
+                        -7.63501717e-05,
+                        -1.14314370e-04,
+                        1.46834330e-03,
+                        -5.58396617e-05,
+                        -1.19303810e-04,
+                        1.82792997e-04,
+                    ],
+                    [
+                        -1.94435159e-05,
+                        -4.21406248e-05,
+                        -3.36571751e-05,
+                        -3.29669876e-05,
+                        -2.93230714e-05,
+                        -3.51283361e-05,
+                        -1.65212276e-05,
+                        -1.85094324e-06,
+                        -2.88047318e-05,
+                        -6.36915085e-06,
+                        -1.96869455e-06,
+                        -3.33153611e-06,
+                        -1.67827839e-05,
+                        -2.45434795e-06,
+                        -4.49766645e-06,
+                        -1.47277391e-06,
+                        -5.58396617e-05,
+                        2.64503039e-04,
+                        -4.46027806e-06,
+                        -2.62648868e-05,
+                    ],
+                    [
+                        7.51170890e-06,
+                        -2.46312269e-06,
+                        -5.75028524e-05,
+                        -1.38484438e-05,
+                        -6.44919191e-05,
+                        -6.29126384e-05,
+                        3.94602035e-06,
+                        6.98892234e-06,
+                        -4.84167784e-05,
+                        2.46107865e-06,
+                        1.04162725e-05,
+                        1.18759135e-06,
+                        9.32366908e-06,
+                        1.57977325e-05,
+                        1.56850630e-06,
+                        1.67644461e-05,
+                        -1.19303810e-04,
+                        -4.46027806e-06,
+                        1.79815850e-04,
+                        -6.07651926e-05,
+                    ],
+                    [
+                        -5.49722926e-05,
+                        -6.61050102e-05,
+                        7.30665182e-05,
+                        -2.56695263e-05,
+                        9.63357501e-05,
+                        8.19963262e-05,
+                        -4.28817059e-05,
+                        -2.93823005e-05,
+                        5.95052975e-05,
+                        -2.58083144e-05,
+                        -4.15805671e-05,
+                        -1.99801411e-05,
+                        -5.66293897e-05,
+                        -5.02422150e-05,
+                        -2.31770766e-05,
+                        -5.08160573e-05,
+                        1.82792997e-04,
+                        -2.62648868e-05,
+                        -6.07651926e-05,
+                        3.08618732e-04,
+                    ],
+                ]
+            ),
+        )
+
+    @pytest.mark.filterwarnings("ignore:The covariance matrix is not positive definite")
+    def test_metadata_routing(self, X, implied_vol):
+        with config_context(enable_metadata_routing=True):
+            model = DetoneCovariance(
+                covariance_estimator=ImpliedCovariance().set_fit_request(
+                    implied_vol=True
+                )
+            )
+
+            with pytest.raises(ValueError, match="`implied_vol` cannot be None"):
+                model.fit(X)
+
+            model.fit(X, implied_vol=implied_vol)
+
+        assert model.covariance_estimator_.r2_scores_.shape == (20,)
+        assert model.covariance_.shape == (20, 20)
+
+
+class TestGerberCovariance:
+    def test_gerber_covariance(self, X):
+        model = GerberCovariance()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        np.testing.assert_almost_equal(
+            model.covariance_,
+            np.array(
+                [
+                    [
+                        3.36703077e-04,
+                        1.81470040e-04,
+                        7.59836524e-05,
+                        1.05986524e-04,
+                        5.38990581e-05,
+                        7.01531478e-05,
+                        6.88072413e-05,
+                        3.45288575e-05,
+                        7.36139822e-05,
+                        3.62682022e-05,
+                        4.60448294e-05,
+                        3.76076861e-05,
+                        1.30174918e-04,
+                        4.35810681e-05,
+                        4.35878478e-05,
+                        4.13366783e-05,
+                        5.72239483e-05,
+                        6.35051726e-05,
+                        4.33204139e-05,
+                        5.01833370e-05,
+                    ],
+                    [
+                        1.81470040e-04,
+                        1.39170799e-03,
+                        1.34207540e-04,
+                        1.68255311e-04,
+                        1.05754595e-04,
+                        1.19198038e-04,
+                        1.09290158e-04,
+                        4.54076889e-05,
+                        1.12211113e-04,
+                        3.98142999e-05,
+                        7.08143043e-05,
+                        5.53351457e-05,
+                        1.84539745e-04,
+                        4.96277564e-05,
+                        6.76546794e-05,
+                        4.67703853e-05,
+                        1.69190997e-04,
+                        8.81689798e-05,
+                        5.68341537e-05,
+                        7.63527912e-05,
+                    ],
+                    [
+                        7.59836524e-05,
+                        1.34207540e-04,
+                        3.92723401e-04,
+                        1.14606785e-04,
+                        1.04445805e-04,
+                        1.32529096e-04,
+                        6.87762105e-05,
+                        3.69424236e-05,
+                        2.20632110e-04,
+                        3.95825565e-05,
+                        4.62825384e-05,
+                        4.42635283e-05,
+                        7.51317241e-05,
+                        2.77847896e-05,
+                        4.91743749e-05,
+                        2.92864720e-05,
+                        1.41060091e-04,
+                        7.02419956e-05,
+                        3.35650483e-05,
+                        9.68212858e-05,
+                    ],
+                    [
+                        1.05986524e-04,
+                        1.68255311e-04,
+                        1.14606785e-04,
+                        6.14955132e-04,
+                        7.73131440e-05,
+                        9.28499075e-05,
+                        1.19016317e-04,
+                        3.73282731e-05,
+                        1.03052862e-04,
+                        3.47108573e-05,
+                        4.05860269e-05,
+                        3.53366049e-05,
+                        8.89957914e-05,
+                        4.09540246e-05,
+                        3.72838274e-05,
+                        4.15144389e-05,
+                        1.06372387e-04,
+                        6.33629979e-05,
+                        6.47343615e-05,
+                        7.04645924e-05,
+                    ],
+                    [
+                        5.38990581e-05,
+                        1.05754595e-04,
+                        1.04445805e-04,
+                        7.73131440e-05,
+                        3.60559076e-04,
+                        1.10987979e-04,
+                        5.23278711e-05,
+                        3.70567279e-05,
+                        9.88829546e-05,
+                        3.67421001e-05,
+                        4.83494072e-05,
+                        4.25613633e-05,
+                        5.84255727e-05,
+                        2.86563680e-05,
+                        4.55825214e-05,
+                        3.04138518e-05,
+                        1.95853228e-04,
+                        4.99804875e-05,
+                        3.00191782e-05,
+                        1.83275668e-04,
+                    ],
+                    [
+                        7.01531478e-05,
+                        1.19198038e-04,
+                        1.32529096e-04,
+                        9.28499075e-05,
+                        1.10987979e-04,
+                        4.82463733e-04,
+                        5.22422547e-05,
+                        3.76340807e-05,
+                        1.25690315e-04,
+                        4.45380574e-05,
+                        4.61677378e-05,
+                        4.03358586e-05,
+                        6.17926931e-05,
+                        3.51423104e-05,
+                        4.55685241e-05,
+                        3.48296080e-05,
+                        1.41584424e-04,
+                        5.41137657e-05,
+                        3.41679407e-05,
+                        1.04702087e-04,
+                    ],
+                    [
+                        6.88072413e-05,
+                        1.09290158e-04,
+                        6.87762105e-05,
+                        1.19016317e-04,
+                        5.23278711e-05,
+                        5.22422547e-05,
+                        2.35075395e-04,
+                        3.75539161e-05,
+                        6.83362229e-05,
+                        3.91029391e-05,
+                        4.43777965e-05,
+                        3.54419669e-05,
+                        7.65733344e-05,
+                        4.52062642e-05,
+                        4.01452839e-05,
+                        4.00436075e-05,
+                        4.51013591e-05,
+                        5.61126261e-05,
+                        5.22382183e-05,
+                        4.62486116e-05,
+                    ],
+                    [
+                        3.45288575e-05,
+                        4.54076889e-05,
+                        3.69424236e-05,
+                        3.73282731e-05,
+                        3.70567279e-05,
+                        3.76340807e-05,
+                        3.75539161e-05,
+                        1.30875861e-04,
+                        3.86774524e-05,
+                        3.54273626e-05,
+                        6.16449758e-05,
+                        5.28249301e-05,
+                        4.11256085e-05,
+                        3.90767376e-05,
+                        5.01740370e-05,
+                        3.96273127e-05,
+                        1.91116190e-05,
+                        4.76657269e-05,
+                        3.19978898e-05,
+                        3.27272466e-05,
+                    ],
+                    [
+                        7.36139822e-05,
+                        1.12211113e-04,
+                        2.20632110e-04,
+                        1.03052862e-04,
+                        9.88829546e-05,
+                        1.25690315e-04,
+                        6.83362229e-05,
+                        3.86774524e-05,
+                        3.01045195e-04,
+                        4.43774453e-05,
+                        4.71163761e-05,
+                        4.61246030e-05,
+                        7.19939345e-05,
+                        3.49517948e-05,
+                        4.97524096e-05,
+                        3.50128202e-05,
+                        1.13497378e-04,
+                        6.76869955e-05,
+                        3.59631838e-05,
+                        9.08519555e-05,
+                    ],
+                    [
+                        3.62682022e-05,
+                        3.98142999e-05,
+                        3.95825565e-05,
+                        3.47108573e-05,
+                        3.67421001e-05,
+                        4.45380574e-05,
+                        3.91029391e-05,
+                        3.54273626e-05,
+                        4.43774453e-05,
+                        1.34070951e-04,
+                        3.45613759e-05,
+                        3.50205132e-05,
+                        4.37540357e-05,
+                        6.29891715e-05,
+                        3.44150890e-05,
+                        5.23641910e-05,
+                        2.21257097e-05,
+                        3.74598868e-05,
+                        3.59509900e-05,
+                        3.54090056e-05,
+                    ],
+                    [
+                        4.60448294e-05,
+                        7.08143043e-05,
+                        4.62825384e-05,
+                        4.05860269e-05,
+                        4.83494072e-05,
+                        4.61677378e-05,
+                        4.43777965e-05,
+                        6.16449758e-05,
+                        4.71163761e-05,
+                        3.45613759e-05,
+                        2.79035339e-04,
+                        7.41294515e-05,
+                        5.92107005e-05,
+                        3.89723719e-05,
+                        7.66169640e-05,
+                        3.83669659e-05,
+                        3.67527225e-05,
+                        6.48890299e-05,
+                        3.44648536e-05,
+                        4.35071673e-05,
+                    ],
+                    [
+                        3.76076861e-05,
+                        5.53351457e-05,
+                        4.42635283e-05,
+                        3.53366049e-05,
+                        4.25613633e-05,
+                        4.03358586e-05,
+                        3.54419669e-05,
+                        5.28249301e-05,
+                        4.61246030e-05,
+                        3.50205132e-05,
+                        7.41294515e-05,
+                        1.86539967e-04,
+                        4.57491397e-05,
+                        3.70314458e-05,
+                        6.94746180e-05,
+                        3.58022460e-05,
+                        2.84337829e-05,
+                        5.19431691e-05,
+                        2.97677998e-05,
+                        3.88554921e-05,
+                    ],
+                    [
+                        1.30174918e-04,
+                        1.84539745e-04,
+                        7.51317241e-05,
+                        8.89957914e-05,
+                        5.84255727e-05,
+                        6.17926931e-05,
+                        7.65733344e-05,
+                        4.11256085e-05,
+                        7.19939345e-05,
+                        4.37540357e-05,
+                        5.92107005e-05,
+                        4.57491397e-05,
+                        2.95164979e-04,
+                        5.12419649e-05,
+                        4.56307197e-05,
+                        4.57356990e-05,
+                        4.59109184e-05,
+                        6.68998295e-05,
+                        4.88533281e-05,
+                        4.96000670e-05,
+                    ],
+                    [
+                        4.35810681e-05,
+                        4.96277564e-05,
+                        2.77847896e-05,
+                        4.09540246e-05,
+                        2.86563680e-05,
+                        3.51423104e-05,
+                        4.52062642e-05,
+                        3.90767376e-05,
+                        3.49517948e-05,
+                        6.29891715e-05,
+                        3.89723719e-05,
+                        3.70314458e-05,
+                        5.12419649e-05,
+                        1.38565484e-04,
+                        3.53558945e-05,
+                        5.61624305e-05,
+                        9.06199705e-06,
+                        3.82804367e-05,
+                        4.29461062e-05,
+                        3.13614916e-05,
+                    ],
+                    [
+                        4.35878478e-05,
+                        6.76546794e-05,
+                        4.91743749e-05,
+                        3.72838274e-05,
+                        4.55825214e-05,
+                        4.55685241e-05,
+                        4.01452839e-05,
+                        5.01740370e-05,
+                        4.97524096e-05,
+                        3.44150890e-05,
+                        7.66169640e-05,
+                        6.94746180e-05,
+                        4.56307197e-05,
+                        3.53558945e-05,
+                        2.01599714e-04,
+                        3.58784012e-05,
+                        4.27462949e-05,
+                        5.49966532e-05,
+                        3.10333906e-05,
+                        3.83660213e-05,
+                    ],
+                    [
+                        4.13366783e-05,
+                        4.67703853e-05,
+                        2.92864720e-05,
+                        4.15144389e-05,
+                        3.04138518e-05,
+                        3.48296080e-05,
+                        4.00436075e-05,
+                        3.96273127e-05,
+                        3.50128202e-05,
+                        5.23641910e-05,
+                        3.83669659e-05,
+                        3.58022460e-05,
+                        4.57356990e-05,
+                        5.61624305e-05,
+                        3.58784012e-05,
+                        1.36805103e-04,
+                        2.05895598e-05,
+                        3.78898256e-05,
+                        4.26335672e-05,
+                        2.99028382e-05,
+                    ],
+                    [
+                        5.72239483e-05,
+                        1.69190997e-04,
+                        1.41060091e-04,
+                        1.06372387e-04,
+                        1.95853228e-04,
+                        1.41584424e-04,
+                        4.51013591e-05,
+                        1.91116190e-05,
+                        1.13497378e-04,
+                        2.21257097e-05,
+                        3.67527225e-05,
+                        2.84337829e-05,
+                        4.59109184e-05,
+                        9.06199705e-06,
+                        4.27462949e-05,
+                        2.05895598e-05,
+                        1.46769445e-03,
+                        3.95276852e-05,
+                        1.97781101e-05,
+                        1.82864071e-04,
+                    ],
+                    [
+                        6.35051726e-05,
+                        8.81689798e-05,
+                        7.02419956e-05,
+                        6.33629979e-05,
+                        4.99804875e-05,
+                        5.41137657e-05,
+                        5.61126261e-05,
+                        4.76657269e-05,
+                        6.76869955e-05,
+                        3.74598868e-05,
+                        6.48890299e-05,
+                        5.19431691e-05,
+                        6.68998295e-05,
+                        3.82804367e-05,
+                        5.49966532e-05,
+                        3.78898256e-05,
+                        3.95276852e-05,
+                        2.64386157e-04,
+                        4.01486856e-05,
+                        4.94351421e-05,
+                    ],
+                    [
+                        4.33204139e-05,
+                        5.68341537e-05,
+                        3.35650483e-05,
+                        6.47343615e-05,
+                        3.00191782e-05,
+                        3.41679407e-05,
+                        5.22382183e-05,
+                        3.19978898e-05,
+                        3.59631838e-05,
+                        3.59509900e-05,
+                        3.44648536e-05,
+                        2.97677998e-05,
+                        4.88533281e-05,
+                        4.29461062e-05,
+                        3.10333906e-05,
+                        4.26335672e-05,
+                        1.97781101e-05,
+                        4.01486856e-05,
+                        1.79736391e-04,
+                        3.08937385e-05,
+                    ],
+                    [
+                        5.01833370e-05,
+                        7.63527912e-05,
+                        9.68212858e-05,
+                        7.04645924e-05,
+                        1.83275668e-04,
+                        1.04702087e-04,
+                        4.62486116e-05,
+                        3.27272466e-05,
+                        9.08519555e-05,
+                        3.54090056e-05,
+                        4.35071673e-05,
+                        3.88554921e-05,
+                        4.96000670e-05,
+                        3.13614916e-05,
+                        3.83660213e-05,
+                        2.99028382e-05,
+                        1.82864071e-04,
+                        4.94351421e-05,
+                        3.08937385e-05,
+                        3.08482356e-04,
+                    ],
+                ]
+            ),
+        )
+
+        model = GerberCovariance(psd_variant=False)
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        np.testing.assert_almost_equal(
+            model.covariance_,
+            np.array(
+                [
+                    [
+                        3.36703077e-04,
+                        2.59738713e-04,
+                        1.09491712e-04,
+                        1.55055267e-04,
+                        7.93229690e-05,
+                        1.02204657e-04,
+                        9.85410831e-05,
+                        5.03578573e-05,
+                        1.05811606e-04,
+                        5.33410851e-05,
+                        6.79721737e-05,
+                        5.52535719e-05,
+                        1.75484641e-04,
+                        6.31818912e-05,
+                        6.32229175e-05,
+                        5.98567552e-05,
+                        8.33370026e-05,
+                        9.25241741e-05,
+                        6.38965633e-05,
+                        7.29294460e-05,
+                    ],
+                    [
+                        2.59738713e-04,
+                        1.39170799e-03,
+                        1.93141599e-04,
+                        2.45069412e-04,
+                        1.56830277e-04,
+                        1.76506484e-04,
+                        1.59306320e-04,
+                        6.72125362e-05,
+                        1.64200645e-04,
+                        5.91862429e-05,
+                        1.04266940e-04,
+                        8.11006382e-05,
+                        2.62618999e-04,
+                        7.43969678e-05,
+                        9.99920176e-05,
+                        6.86271578e-05,
+                        2.46553544e-04,
+                        1.29907822e-04,
+                        8.45689814e-05,
+                        1.12013863e-04,
+                    ],
+                    [
+                        1.09491712e-04,
+                        1.93141599e-04,
+                        3.92723401e-04,
+                        1.65222324e-04,
+                        1.51365547e-04,
+                        1.89240176e-04,
+                        9.84226855e-05,
+                        5.34565922e-05,
+                        2.67504262e-04,
+                        5.74749428e-05,
+                        6.75803327e-05,
+                        6.43590129e-05,
+                        1.07204217e-04,
+                        4.03948571e-05,
+                        7.06858655e-05,
+                        4.20282695e-05,
+                        2.03530342e-04,
+                        1.01799618e-04,
+                        4.94055789e-05,
+                        1.37587519e-04,
+                    ],
+                    [
+                        1.55055267e-04,
+                        2.45069412e-04,
+                        1.65222324e-04,
+                        6.14955132e-04,
+                        1.13980424e-04,
+                        1.37661253e-04,
+                        1.68020077e-04,
+                        5.41599308e-05,
+                        1.48673817e-04,
+                        5.13991467e-05,
+                        5.96019468e-05,
+                        5.17195819e-05,
+                        1.28600248e-04,
+                        6.05987952e-05,
+                        5.47208457e-05,
+                        6.05633872e-05,
+                        1.55444229e-04,
+                        9.36385172e-05,
+                        9.41889951e-05,
+                        1.02646063e-04,
+                    ],
+                    [
+                        7.93229690e-05,
+                        1.56830277e-04,
+                        1.51365547e-04,
+                        1.13980424e-04,
+                        3.60559076e-04,
+                        1.60265421e-04,
+                        7.67878568e-05,
+                        5.40312628e-05,
+                        1.42498441e-04,
+                        5.40018149e-05,
+                        7.16081638e-05,
+                        6.23932809e-05,
+                        8.44003007e-05,
+                        4.28562269e-05,
+                        6.70550680e-05,
+                        4.40962221e-05,
+                        2.77273200e-04,
+                        7.36769251e-05,
+                        4.43110756e-05,
+                        2.33878149e-04,
+                    ],
+                    [
+                        1.02204657e-04,
+                        1.76506484e-04,
+                        1.89240176e-04,
+                        1.37661253e-04,
+                        1.60265421e-04,
+                        4.82463733e-04,
+                        7.61780147e-05,
+                        5.47806180e-05,
+                        1.75888378e-04,
+                        6.55061369e-05,
+                        6.86660445e-05,
+                        5.91264647e-05,
+                        8.92713011e-05,
+                        5.19359596e-05,
+                        6.63410394e-05,
+                        5.08759777e-05,
+                        2.04841692e-04,
+                        8.00058097e-05,
+                        5.07106300e-05,
+                        1.48126536e-04,
+                    ],
+                    [
+                        9.85410831e-05,
+                        1.59306320e-04,
+                        9.84226855e-05,
+                        1.68020077e-04,
+                        7.67878568e-05,
+                        7.61780147e-05,
+                        2.35075395e-04,
+                        5.36004671e-05,
+                        9.77484659e-05,
+                        5.64307400e-05,
+                        6.48427374e-05,
+                        5.13789050e-05,
+                        1.09451502e-04,
+                        6.54481924e-05,
+                        5.86303366e-05,
+                        5.78621403e-05,
+                        6.49949811e-05,
+                        8.06056256e-05,
+                        7.45225568e-05,
+                        6.66373556e-05,
+                    ],
+                    [
+                        5.03578573e-05,
+                        6.72125362e-05,
+                        5.34565922e-05,
+                        5.41599308e-05,
+                        5.40312628e-05,
+                        5.47806180e-05,
+                        5.36004671e-05,
+                        1.30875861e-04,
+                        5.60158938e-05,
+                        5.08996106e-05,
+                        8.69226360e-05,
+                        7.28345529e-05,
+                        5.87856832e-05,
+                        5.49263894e-05,
+                        7.11018842e-05,
+                        5.61261989e-05,
+                        2.80771213e-05,
+                        6.82970678e-05,
+                        4.66172115e-05,
+                        4.80990329e-05,
+                    ],
+                    [
+                        1.05811606e-04,
+                        1.64200645e-04,
+                        2.67504262e-04,
+                        1.48673817e-04,
+                        1.42498441e-04,
+                        1.75888378e-04,
+                        9.77484659e-05,
+                        5.60158938e-05,
+                        3.01045195e-04,
+                        6.40428222e-05,
+                        6.91850573e-05,
+                        6.61254393e-05,
+                        1.01709699e-04,
+                        5.01359513e-05,
+                        7.19511311e-05,
+                        4.99441816e-05,
+                        1.64485204e-04,
+                        9.78971860e-05,
+                        5.25376833e-05,
+                        1.29197251e-04,
+                    ],
+                    [
+                        5.33410851e-05,
+                        5.91862429e-05,
+                        5.74749428e-05,
+                        5.13991467e-05,
+                        5.40018149e-05,
+                        6.55061369e-05,
+                        5.64307400e-05,
+                        5.08996106e-05,
+                        6.40428222e-05,
+                        1.34070951e-04,
+                        5.09018115e-05,
+                        5.08108101e-05,
+                        6.26558952e-05,
+                        8.39118142e-05,
+                        5.03431534e-05,
+                        7.17213253e-05,
+                        3.24637323e-05,
+                        5.48727240e-05,
+                        5.19446849e-05,
+                        5.15497127e-05,
+                    ],
+                    [
+                        6.79721737e-05,
+                        1.04266940e-04,
+                        6.75803327e-05,
+                        5.96019468e-05,
+                        7.16081638e-05,
+                        6.86660445e-05,
+                        6.48427374e-05,
+                        8.69226360e-05,
+                        6.91850573e-05,
+                        5.09018115e-05,
+                        2.79035339e-04,
+                        1.04433688e-04,
+                        8.60347477e-05,
+                        5.65544589e-05,
+                        1.07124591e-04,
+                        5.58498933e-05,
+                        5.48734840e-05,
+                        9.31736469e-05,
+                        5.04125987e-05,
+                        6.39314297e-05,
+                    ],
+                    [
+                        5.52535719e-05,
+                        8.11006382e-05,
+                        6.43590129e-05,
+                        5.17195819e-05,
+                        6.23932809e-05,
+                        5.91264647e-05,
+                        5.13789050e-05,
+                        7.28345529e-05,
+                        6.61254393e-05,
+                        5.08108101e-05,
+                        1.04433688e-04,
+                        1.86539967e-04,
+                        6.55564991e-05,
+                        5.28600255e-05,
+                        9.65218962e-05,
+                        5.14681100e-05,
+                        4.09363178e-05,
+                        7.48882632e-05,
+                        4.35332486e-05,
+                        5.66260792e-05,
+                    ],
+                    [
+                        1.75484641e-04,
+                        2.62618999e-04,
+                        1.07204217e-04,
+                        1.28600248e-04,
+                        8.44003007e-05,
+                        8.92713011e-05,
+                        1.09451502e-04,
+                        5.87856832e-05,
+                        1.01709699e-04,
+                        6.26558952e-05,
+                        8.60347477e-05,
+                        6.55564991e-05,
+                        2.95164979e-04,
+                        7.35409978e-05,
+                        6.61064920e-05,
+                        6.52042832e-05,
+                        6.67061616e-05,
+                        9.57482609e-05,
+                        7.10895859e-05,
+                        7.09214267e-05,
+                    ],
+                    [
+                        6.31818912e-05,
+                        7.43969678e-05,
+                        4.03948571e-05,
+                        6.05987952e-05,
+                        4.28562269e-05,
+                        5.19359596e-05,
+                        6.54481924e-05,
+                        5.49263894e-05,
+                        5.01359513e-05,
+                        8.39118142e-05,
+                        5.65544589e-05,
+                        5.28600255e-05,
+                        7.35409978e-05,
+                        1.38565484e-04,
+                        5.10231684e-05,
+                        7.65227006e-05,
+                        1.33530078e-05,
+                        5.54946405e-05,
+                        6.18057249e-05,
+                        4.59275123e-05,
+                    ],
+                    [
+                        6.32229175e-05,
+                        9.99920176e-05,
+                        7.06858655e-05,
+                        5.47208457e-05,
+                        6.70550680e-05,
+                        6.63410394e-05,
+                        5.86303366e-05,
+                        7.11018842e-05,
+                        7.19511311e-05,
+                        5.03431534e-05,
+                        1.07124591e-04,
+                        9.65218962e-05,
+                        6.61064920e-05,
+                        5.10231684e-05,
+                        2.01599714e-04,
+                        5.18398260e-05,
+                        6.24021345e-05,
+                        8.01716755e-05,
+                        4.58819945e-05,
+                        5.57058604e-05,
+                    ],
+                    [
+                        5.98567552e-05,
+                        6.86271578e-05,
+                        4.20282695e-05,
+                        6.05633872e-05,
+                        4.40962221e-05,
+                        5.08759777e-05,
+                        5.78621403e-05,
+                        5.61261989e-05,
+                        4.99441816e-05,
+                        7.17213253e-05,
+                        5.58498933e-05,
+                        5.14681100e-05,
+                        6.52042832e-05,
+                        7.65227006e-05,
+                        5.18398260e-05,
+                        1.36805103e-04,
+                        2.99624528e-05,
+                        5.49979716e-05,
+                        6.12954234e-05,
+                        4.31980769e-05,
+                    ],
+                    [
+                        8.33370026e-05,
+                        2.46553544e-04,
+                        2.03530342e-04,
+                        1.55444229e-04,
+                        2.77273200e-04,
+                        2.04841692e-04,
+                        6.49949811e-05,
+                        2.80771213e-05,
+                        1.64485204e-04,
+                        3.24637323e-05,
+                        5.48734840e-05,
+                        4.09363178e-05,
+                        6.67061616e-05,
+                        1.33530078e-05,
+                        6.24021345e-05,
+                        2.99624528e-05,
+                        1.46769445e-03,
+                        5.88057530e-05,
+                        2.93653545e-05,
+                        2.59807730e-04,
+                    ],
+                    [
+                        9.25241741e-05,
+                        1.29907822e-04,
+                        1.01799618e-04,
+                        9.36385172e-05,
+                        7.36769251e-05,
+                        8.00058097e-05,
+                        8.06056256e-05,
+                        6.82970678e-05,
+                        9.78971860e-05,
+                        5.48727240e-05,
+                        9.31736469e-05,
+                        7.48882632e-05,
+                        9.57482609e-05,
+                        5.54946405e-05,
+                        8.01716755e-05,
+                        5.49979716e-05,
+                        5.88057530e-05,
+                        2.64386157e-04,
+                        5.86401162e-05,
+                        7.19687765e-05,
+                    ],
+                    [
+                        6.38965633e-05,
+                        8.45689814e-05,
+                        4.94055789e-05,
+                        9.41889951e-05,
+                        4.43110756e-05,
+                        5.07106300e-05,
+                        7.45225568e-05,
+                        4.66172115e-05,
+                        5.25376833e-05,
+                        5.19446849e-05,
+                        5.04125987e-05,
+                        4.35332486e-05,
+                        7.10895859e-05,
+                        6.18057249e-05,
+                        4.58819945e-05,
+                        6.12954234e-05,
+                        2.93653545e-05,
+                        5.86401162e-05,
+                        1.79736391e-04,
+                        4.53155349e-05,
+                    ],
+                    [
+                        7.29294460e-05,
+                        1.12013863e-04,
+                        1.37587519e-04,
+                        1.02646063e-04,
+                        2.33878149e-04,
+                        1.48126536e-04,
+                        6.66373556e-05,
+                        4.80990329e-05,
+                        1.29197251e-04,
+                        5.15497127e-05,
+                        6.39314297e-05,
+                        5.66260792e-05,
+                        7.09214267e-05,
+                        4.59275123e-05,
+                        5.57058604e-05,
+                        4.31980769e-05,
+                        2.59807730e-04,
+                        7.19687765e-05,
+                        4.53155349e-05,
+                        3.08482356e-04,
+                    ],
+                ]
+            ),
+        )
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered")
+@pytest.mark.filterwarnings("ignore:overflow encountered in dot:RuntimeWarning")
+@pytest.mark.filterwarnings(
+    "ignore:Objective did not converge:sklearn.exceptions.ConvergenceWarning"
+)
+class TestGraphicalLassoCV:
+    def test_fit(self, X):
+        model = GraphicalLassoCV()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+
+
+class TestOAS:
+    def test_fit(self, X):
+        model = OAS()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+
+
+class TestLedoitWolf:
+    def test_fit(self, X):
+        model = LedoitWolf()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+
+
+class TestShrunkCovariance:
+    def test_fit(self, X):
+        model = ShrunkCovariance()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+
+
+class TestGeodesicShrinkageCovariance:
+    @pytest.fixture
+    def ill_conditioned_returns(self):
+        rng = np.random.default_rng(42)
+        basis, _ = np.linalg.qr(rng.standard_normal((6, 6)))
+        return (
+            rng.standard_normal((100, 6))
+            @ np.diag(np.geomspace(1e-6, 1.0, 6))
+            @ basis.T
+            * 0.01
+        )
+
+    def test_fit(self, X):
+        model = GeodesicShrinkageCovariance()
+        model.fit(X)
+        assert model.covariance_.shape == (20, 20)
+        assert np.all(np.linalg.eigvalsh(model.covariance_) > 0)
+
+    def test_default_fit_repairs_rank_deficient_returns(self):
+        X = np.random.default_rng(10).standard_normal((4, 6)) * 0.01
+        with pytest.warns(UserWarning, match="not positive definite"):
+            model = GeodesicShrinkageCovariance().fit(X)
+
+        np.linalg.cholesky(model.covariance_)
+        assert np.linalg.eigh(model.covariance_)[0][0] > 0
+
+    def test_shrinkage_zero_matches_covariance_estimator(self, X):
+        base = EmpiricalCovariance()
+        model = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(), shrinkage=0.0
+        )
+        model.fit(X)
+        base.fit(X)
+        np.testing.assert_allclose(model.covariance_, base.covariance_)
+
+    def test_shrinkage_one_matches_target(self):
+        rng = np.random.default_rng(7)
+        X = rng.standard_normal((100, 4)) * 0.01
+
+        model = GeodesicShrinkageCovariance(
+            shrinkage=1.0, target=GeodesicShrinkageTarget.SCALED_IDENTITY
+        )
+        model.fit(X)
+
+        base = EmpiricalCovariance(nearest=False).fit(X)
+        mu = np.trace(base.covariance_) / base.covariance_.shape[0]
+        expected_target = mu * np.identity(base.covariance_.shape[0])
+        np.testing.assert_allclose(model.covariance_, expected_target, atol=1e-10)
+
+    @pytest.mark.parametrize(
+        "target", [*GeodesicShrinkageTarget, "scaled_identity", "diagonal"]
+    )
+    @pytest.mark.parametrize("shrinkage", [0.1, 0.5, 0.9])
+    def test_matches_manual_geodesic_interpolation(self, target, shrinkage):
+        rng = np.random.default_rng(11)
+        X = rng.standard_normal((150, 5)) * 0.01
+
+        model = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(nearest=False),
+            shrinkage=shrinkage,
+            target=target,
+        )
+        model.fit(X)
+
+        start = EmpiricalCovariance(nearest=False).fit(X).covariance_
+        if target == GeodesicShrinkageTarget.SCALED_IDENTITY:
+            mu = np.trace(start) / start.shape[0]
+            end = mu * np.identity(start.shape[0])
+        else:
+            end = np.diag(np.diag(start))
+        expected = _geodesic_interpolation(start=start, end=end, alpha=shrinkage)
+
+        np.testing.assert_allclose(model.covariance_, expected)
+
+    def test_custom_array_target(self):
+        rng = np.random.default_rng(3)
+        X = rng.standard_normal((100, 3)) * 0.01
+        target = np.identity(3) * 2.0
+
+        model = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(nearest=False),
+            shrinkage=0.4,
+            target=target,
+        )
+        model.fit(X)
+
+        start = EmpiricalCovariance(nearest=False).fit(X).covariance_
+        expected = _geodesic_interpolation(start=start, end=target, alpha=0.4)
+        np.testing.assert_allclose(model.covariance_, expected)
+
+    def test_ill_conditioned_scaled_identity_matches_explicit_target(
+        self, ill_conditioned_returns
+    ):
+        X = ill_conditioned_returns
+        model = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(nearest=False),
+            shrinkage=0.5,
+            nearest=False,
+        ).fit(X)
+        start = model.covariance_estimator_.covariance_
+        target = np.identity(start.shape[0]) * np.trace(start) / start.shape[0]
+        explicit = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(nearest=False),
+            target=target,
+            shrinkage=0.5,
+            nearest=False,
+        ).fit(X)
+
+        # Whole-matrix error avoids relative comparisons of near-zero entries.
+        assert (
+            np.linalg.norm(explicit.covariance_ - model.covariance_)
+            / np.linalg.norm(model.covariance_)
+            < 1e-8
+        )
+
+    def test_ill_conditioned_diagonal_matches_correlation_reference(
+        self, ill_conditioned_returns
+    ):
+        model = GeodesicShrinkageCovariance(
+            covariance_estimator=EmpiricalCovariance(nearest=False),
+            target=GeodesicShrinkageTarget.DIAGONAL,
+            shrinkage=0.5,
+            nearest=False,
+        ).fit(ill_conditioned_returns)
+        start = model.covariance_estimator_.covariance_
+        std = np.sqrt(np.diag(start))
+        scale = np.outer(std, std)
+        eigenvalues, eigenvectors = np.linalg.eigh(start / scale)
+        # Independent identity: the geodesic to diag(start) is D R**(1-alpha) D.
+        expected = ((eigenvectors * np.sqrt(eigenvalues)) @ eigenvectors.T) * scale
+
+        assert (
+            np.linalg.norm(model.covariance_ - expected) / np.linalg.norm(expected)
+            < 1e-8
+        )
+
+    @pytest.mark.parametrize("target", list(GeodesicShrinkageTarget))
+    @pytest.mark.parametrize("higham", [False, True])
+    def test_repaired_start_matches_independent_reference(self, target, higham):
+        X = np.random.default_rng(0).standard_normal((20, 50)) * 0.01
+        with pytest.warns(UserWarning, match="not positive definite"):
+            start = EmpiricalCovariance(higham=higham).fit(X).covariance_
+
+        if target == GeodesicShrinkageTarget.SCALED_IDENTITY:
+            mu = np.trace(start) / start.shape[0]
+            eigenvalues, eigenvectors = np.linalg.eigh(start)
+            expected = (eigenvectors * np.sqrt(eigenvalues * mu)) @ eigenvectors.T
+            # An explicit array exercises the general interpolation path.
+            target = np.identity(start.shape[0]) * mu
+        else:
+            std = np.sqrt(np.diag(start))
+            scale = np.outer(std, std)
+            eigenvalues, eigenvectors = np.linalg.eigh(start / scale)
+            expected = ((eigenvectors * np.sqrt(eigenvalues)) @ eigenvectors.T) * scale
+
+        with pytest.warns(UserWarning, match="not positive definite"):
+            model = GeodesicShrinkageCovariance(
+                covariance_estimator=EmpiricalCovariance(higham=higham),
+                target=target,
+                shrinkage=0.5,
+                higham=higham,
+            ).fit(X)
+
+        # Allow solver differences at the repair floor, while detecting the former
+        # inverse-square-root instability (about 9% relative error on this fixture).
+        assert (
+            np.linalg.norm(model.covariance_ - expected) / np.linalg.norm(expected)
+            < 1e-6
+        )
+
+    @pytest.mark.parametrize("scale", [0.01, 100.0])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            *GeodesicShrinkageTarget,
+            pytest.param(
+                np.array([[2.0, 0.3, 0.0], [0.3, 1.0, 0.2], [0.0, 0.2, 3.0]]) * 1e-4,
+                id="custom",
+            ),
+        ],
+    )
+    def test_scaling_returns_and_target(self, target, scale):
+        X = np.random.default_rng(17).standard_normal((100, 3)) * [0.01, 0.02, 0.03]
+        model = GeodesicShrinkageCovariance(
+            target=target, shrinkage=0.4, nearest=False
+        ).fit(X)
+        scaled_target = target * scale**2 if isinstance(target, np.ndarray) else target
+        scaled = GeodesicShrinkageCovariance(
+            target=scaled_target, shrinkage=0.4, nearest=False
+        ).fit(X * scale)
+
+        np.testing.assert_allclose(
+            scaled.covariance_ / scale**2, model.covariance_, rtol=1e-10, atol=1e-15
+        )
+
+    def test_wraps_other_covariance_estimator(self, X):
+        model = GeodesicShrinkageCovariance(covariance_estimator=LedoitWolf())
+        model.fit(X)
+        assert isinstance(model.covariance_estimator_, LedoitWolf)
+        assert model.covariance_.shape == (20, 20)
+
+    @pytest.mark.parametrize("shrinkage", [-0.1, 1.1, "a", True, float("nan")])
+    def test_invalid_shrinkage_raises(self, shrinkage):
+        X = np.random.default_rng(0).standard_normal((50, 3))
+        with pytest.raises(ValueError, match="shrinkage"):
+            GeodesicShrinkageCovariance(shrinkage=shrinkage).fit(X)
+
+    def test_invalid_target_string_raises(self):
+        X = np.random.default_rng(0).standard_normal((50, 3))
+        with pytest.raises(ValueError, match="target"):
+            GeodesicShrinkageCovariance(target="not-a-target").fit(X)
+
+    def test_invalid_target_shape_raises(self):
+        X = np.random.default_rng(0).standard_normal((50, 3))
+        with pytest.raises(ValueError, match="target"):
+            GeodesicShrinkageCovariance(target=np.identity(2)).fit(X)
+
+    def test_metadata_routing(self, X, implied_vol):
+        with config_context(enable_metadata_routing=True):
+            model = GeodesicShrinkageCovariance(
+                covariance_estimator=ImpliedCovariance().set_fit_request(
+                    implied_vol=True
+                )
+            )
+            with pytest.raises(ValueError, match="`implied_vol` cannot be None"):
+                model.fit(X)
+            model.fit(X, implied_vol=implied_vol)
+        assert model.covariance_estimator_.r2_scores_.shape == (20,)
+        assert model.covariance_.shape == (20, 20)
+
+    def test_location_and_inference_match_wrapped_estimator(self):
+        rng = np.random.default_rng(17)
+        X = rng.normal(loc=[2.0, -1.0, 4.0], size=(150, 3))
+        X_test = rng.normal(loc=[2.0, -1.0, 4.0], size=(25, 3))
+        model = GeodesicShrinkageCovariance(shrinkage=0).fit(X)
+        base = model.covariance_estimator_
+        np.testing.assert_allclose(model.location_, base.location_)
+        assert model.score(X_test) == pytest.approx(base.score(X_test))
+        np.testing.assert_allclose(model.mahalanobis(X_test), base.mahalanobis(X_test))
+        # Refitting with an estimator without a mean must not retain a stale mean.
+        model.set_params(covariance_estimator=GerberCovariance()).fit(X)
+        assert not hasattr(model, "location_")
+
+    @pytest.mark.parametrize("shrinkage", [0.0, 0.5, 1.0])
+    @pytest.mark.parametrize("nearest", [False, True])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            [[1.0, 2.0], [2.0, 1.0]],  # indefinite
+            [[1.0, 1.0], [1.0, 1.0]],  # singular
+        ],
+    )
+    def test_non_pd_target_raises(self, shrinkage, nearest, target):
+        X = np.random.default_rng(0).standard_normal((50, 2))
+        with pytest.raises(ValueError, match="target must be positive definite"):
+            GeodesicShrinkageCovariance(
+                shrinkage=shrinkage, target=target, nearest=nearest
+            ).fit(X)
+
+    def test_non_finite_target_raises(self):
+        X = np.random.default_rng(0).standard_normal((50, 2))
+        with pytest.raises(ValueError, match="finite"):
+            GeodesicShrinkageCovariance(target=np.diag([np.inf, 1.0])).fit(X)
+
+    @pytest.mark.parametrize("target", list(GeodesicShrinkageTarget))
+    @pytest.mark.parametrize("higham", [False, True])
+    @pytest.mark.parametrize("seed, scale", [(0, 1.0), (10, 0.01)])
+    def test_nearest_repairs_singular_start(self, target, higham, seed, scale):
+        X = np.random.default_rng(seed).standard_normal((4, 6)) * scale
+        with pytest.warns(UserWarning, match="not positive definite"):
+            model = GeodesicShrinkageCovariance(
+                covariance_estimator=EmpiricalCovariance(nearest=False),
+                target=target,
+                higham=higham,
+            ).fit(X)
+        np.linalg.cholesky(model.covariance_)
+        assert np.all(np.linalg.eigvalsh(model.covariance_) > 0)
+
+    @pytest.mark.parametrize("target", list(GeodesicShrinkageTarget))
+    def test_singular_start_raises_without_repair(self, target):
+        # Exact singularity avoids platform-dependent signs of rounded eigenvalues.
+        X = np.array([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+        with pytest.raises(ValueError, match=r"start.*positive definite"):
+            GeodesicShrinkageCovariance(
+                covariance_estimator=EmpiricalCovariance(nearest=False),
+                target=target,
+                nearest=False,
+            ).fit(X)
+
+    @pytest.mark.parametrize("shrinkage", [0.0, 0.1, 0.5, 1.0])
+    def test_scaled_identity_condition_number(self, shrinkage):
+        X = np.random.default_rng(21).standard_normal((100, 4)) * [1, 2, 4, 8]
+        model = GeodesicShrinkageCovariance(shrinkage=shrinkage, nearest=False).fit(X)
+        start = model.covariance_estimator_.covariance_
+        assert np.linalg.cond(model.covariance_) == pytest.approx(
+            np.linalg.cond(start) ** (1 - shrinkage)
+        )
+
+    @pytest.mark.parametrize("shrinkage", [0.0, 0.5, 1.0])
+    def test_diagonal_target_variances(self, shrinkage):
+        rng = np.random.default_rng(7)
+        X = rng.standard_normal((200, 2)) @ np.array([[1.0, 0.8], [0.0, 0.6]])
+        model = GeodesicShrinkageCovariance(
+            target=GeodesicShrinkageTarget.DIAGONAL,
+            shrinkage=shrinkage,
+            nearest=False,
+        ).fit(X)
+        start = model.covariance_estimator_.covariance_
+        if shrinkage in (0.0, 1.0):
+            np.testing.assert_allclose(np.diag(model.covariance_), np.diag(start))
+        else:
+            assert not np.allclose(np.diag(model.covariance_), np.diag(start))
+        if shrinkage == 1.0:
+            np.testing.assert_array_equal(model.covariance_, np.diag(np.diag(start)))
+
+
+class TestBaseCovarianceEdgeCases:
+    """Edge cases of the `BaseCovariance` inference and sanity-check helpers."""
+
+    def test_score_without_finite_fitted_assets_raises(self, X_small):
+        model = EmpiricalCovariance().fit(np.asarray(X_small))
+        model.covariance_ = np.full_like(model.covariance_, np.nan)
+        with pytest.raises(
+            ValueError, match="No finite fitted assets available for inference"
+        ):
+            model.score(np.asarray(X_small))
+
+    def test_mahalanobis_without_finite_fitted_assets_raises(self, X_small):
+        model = EmpiricalCovariance().fit(np.asarray(X_small))
+        model.covariance_ = np.full_like(model.covariance_, np.nan)
+        with pytest.raises(
+            ValueError, match="No finite fitted assets available for inference"
+        ):
+            model.mahalanobis(np.asarray(X_small))
+
+    def test_mahalanobis_all_nan_rows_raises(self, X_small):
+        model = EmpiricalCovariance().fit(np.asarray(X_small))
+        X_test = np.full((2, X_small.shape[1]), np.nan)
+        with pytest.raises(
+            ValueError,
+            match="X has no row with any finite retained observation",
+        ):
+            model.mahalanobis(X_test)
+
+    def test_mahalanobis_single_observation_with_nan(self, X_small):
+        X_arr = np.asarray(X_small)
+        model = EmpiricalCovariance().fit(X_arr)
+        row = X_arr[0].copy()
+        row[0] = np.nan
+        distance = model.mahalanobis(row)
+        assert isinstance(distance, float)
+        assert np.isfinite(distance)
+        # Matches the observed-subspace distance of the same row given as a batch
+        np.testing.assert_allclose(distance, model.mahalanobis(row[np.newaxis, :])[0])
+
+    def test_sanity_check_non_positive_variance_by_index(self):
+        model = _MinimalCovariance(nearest=False)
+        with pytest.raises(
+            NonPositiveVarianceError,
+            match="The following assets indices have a non positive variance",
+        ):
+            model._set_covariance(np.zeros((2, 2)))
+
+    def test_sanity_check_non_positive_variance_by_name(self):
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame(
+            {"CONST": np.ones(50), "RAND": rng.standard_normal(50)},
+        )
+        with pytest.raises(
+            NonPositiveVarianceError,
+            match="The following assets have a non positive variance",
+        ) as exc_info:
+            EmpiricalCovariance().fit(X)
+        assert "CONST" in str(exc_info.value)
+        assert "RAND" not in str(exc_info.value)
+
+    def test_reduce_to_finite_active_block_without_finite_diagonal(self):
+        cov = np.full((2, 2), np.nan)
+        _reduce_to_finite_active_block(cov)
+        assert np.all(np.isnan(cov))
+
+
+def test_gerber_covariance_invalid_threshold(X):
+    model = GerberCovariance(threshold=1.5)
+    with pytest.raises(ValueError, match="The threshold must be between 0 and 1"):
+        model.fit(X)
+
+
+class TestGeodesicInterpolation:
+    @pytest.fixture
+    def spd_pair(self):
+        rng = np.random.default_rng(42)
+        n = 6
+        a = rng.normal(size=(n, n))
+        start = a @ a.T + n * np.identity(n)
+        b = rng.normal(size=(n, n))
+        end = b @ b.T + n * np.identity(n)
+        return start, end
+
+    def test_alpha_zero_returns_start(self, spd_pair):
+        start, end = spd_pair
+        result = _geodesic_interpolation(start, end, alpha=0.0)
+        np.testing.assert_allclose(result, start)
+        assert not np.shares_memory(result, start)
+
+    def test_alpha_one_returns_end(self, spd_pair):
+        start, end = spd_pair
+        result = _geodesic_interpolation(start, end, alpha=1.0)
+        np.testing.assert_allclose(result, end)
+        assert not np.shares_memory(result, end)
+
+    @pytest.mark.parametrize("alpha", [0.1, 0.3, 0.5, 0.7, 0.9])
+    def test_matches_independent_reference(self, spd_pair, alpha):
+        import scipy.linalg as scl
+
+        start, end = spd_pair
+        original_start, original_end = start.copy(), end.copy()
+        result = _geodesic_interpolation(start, end, alpha=alpha)
+        np.testing.assert_array_equal(start, original_start)
+        np.testing.assert_array_equal(end, original_end)
+
+        # Independent reference computed with a different set of scipy primitives
+        # (sqrtm / inv / fractional_matrix_power) than the implementation
+        # (eigh-based), mirroring the affine-invariant geodesic formula.
+        start_sqrt = scl.sqrtm(start).real
+        start_inv_sqrt = scl.inv(start_sqrt)
+        middle = start_inv_sqrt @ end @ start_inv_sqrt
+        middle_pow = scl.fractional_matrix_power(middle, alpha).real
+        expected = start_sqrt @ middle_pow @ start_sqrt
+
+        np.testing.assert_allclose(result, expected, atol=1e-8)
+
+    @pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
+    def test_result_is_symmetric_positive_definite(self, spd_pair, alpha):
+        start, end = spd_pair
+        result = _geodesic_interpolation(start, end, alpha=alpha)
+        np.testing.assert_allclose(result, result.T)
+        assert np.all(np.linalg.eigvalsh(result) > 0)
+
+    def test_invalid_alpha_raises(self, spd_pair):
+        start, end = spd_pair
+        with pytest.raises(ValueError, match="alpha"):
+            _geodesic_interpolation(start, end, alpha=1.5)
+        with pytest.raises(ValueError, match="alpha"):
+            _geodesic_interpolation(start, end, alpha=-0.1)
+
+    def test_shape_mismatch_raises(self, spd_pair):
+        start, _ = spd_pair
+        end = np.identity(start.shape[0] + 1)
+        with pytest.raises(ValueError, match="same shape"):
+            _geodesic_interpolation(start, end, alpha=0.5)
+
+    def test_non_symmetric_raises(self, spd_pair):
+        start, end = spd_pair
+        start = start.copy()
+        start[0, 1] += 1.0
+        with pytest.raises(ValueError, match="symmetric"):
+            _geodesic_interpolation(start, end, alpha=0.5)
+
+    def test_non_positive_definite_raises(self, spd_pair):
+        _, end = spd_pair
+        not_pd = np.array([[1.0, 2.0], [2.0, 1.0]])
+        end_2 = end[:2, :2]
+        with pytest.raises(ValueError, match="positive definite"):
+            _geodesic_interpolation(not_pd, end_2, alpha=0.5)
+
+    @pytest.mark.parametrize(
+        "end", [[[1.0, 2.0], [2.0, 1.0]], [[1.0, 1.0], [1.0, 1.0]]]
+    )
+    def test_non_positive_definite_end_raises(self, end):
+        with pytest.raises(ValueError, match=r"end.*positive definite"):
+            _geodesic_interpolation(np.identity(2), np.array(end), alpha=0.5)

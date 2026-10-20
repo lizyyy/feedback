@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import sklearn.base as skb
+from sklearn import config_context
+
+from skfolio import MultiPeriodPortfolio, RiskMeasure
+from skfolio.distribution import VineCopula
+from skfolio.model_selection import WalkForward, cross_val_predict
+from skfolio.optimization import MeanRisk
+from skfolio.prior import SyntheticData, TimeSeriesFactorModel
+
+
+def test_synthetic_data(X):
+    X = X.iloc[-300:]
+    model = SyntheticData()
+    model.fit(X)
+    res = model.return_distribution_
+    assert hash(res)
+    assert res.mu.shape == (20,)
+    assert res.covariance.shape == (20, 20)
+    assert res.returns.shape == (1000, 20)
+
+
+def test_factor_synthetic_data(X, factors):
+    X = X.iloc[-300:]
+    factors = factors.loc[X.index]
+    model = TimeSeriesFactorModel(
+        factor_prior_estimator=SyntheticData(),
+    )
+    model.fit(X, factors=factors)
+    res = model.return_distribution_
+    assert hash(res)
+    assert res.mu.shape == (20,)
+    assert res.covariance.shape == (20, 20)
+    assert res.returns.shape == (1000, 20)
+
+
+def test_factor_stress_test(X, factors):
+    model = TimeSeriesFactorModel(
+        factor_prior_estimator=SyntheticData(
+            distribution_estimator=VineCopula(
+                central_assets=["QUAL"], log_transform=True, n_jobs=-1, random_state=42
+            ),
+            n_samples=10000,
+            sample_args=dict(conditioning={"QUAL": -0.8}),
+        )
+    )
+    model.fit(X, factors=factors)
+    res = model.return_distribution_
+    assert hash(res)
+    assert res.mu.shape == (20,)
+    assert res.covariance.shape == (20, 20)
+    assert res.returns.shape == (10000, 20)
+    np.testing.assert_almost_equal(
+        res.returns[:5, :5],
+        [
+            [-0.86294093, -1.11156425, -0.75854301, -0.82283136, -0.63883654],
+            [-0.9419662, -1.27665467, -0.85295726, -0.85935132, -0.70171624],
+            [-0.82122944, -1.01823713, -0.82881924, -0.85346634, -0.68590999],
+            [-0.89897468, -1.17230283, -0.7521866, -0.81503241, -0.63313694],
+            [-0.84638832, -1.08273094, -0.77658093, -0.83103323, -0.65410704],
+        ],
+        5,
+    )
+
+
+def test_optimization_synthetic_data(X):
+    X = X.iloc[-800:]
+    model = MeanRisk(
+        risk_measure=RiskMeasure.CVAR,
+        prior_estimator=SyntheticData(
+            distribution_estimator=VineCopula(log_transform=True, n_jobs=-1),
+            n_samples=500,
+        ),
+    )
+    cv = WalkForward(train_size=252, test_size=100)
+    prediction = cross_val_predict(model, X, cv=cv, n_jobs=-1)
+    assert isinstance(prediction, MultiPeriodPortfolio)
+    assert len(prediction) == cv.get_n_splits(X)
+
+
+class _NoSampleEstimator(skb.BaseEstimator):
+    def fit(self, X, y=None):
+        return self
+
+
+class _SampleWithoutNSamplesEstimator(skb.BaseEstimator):
+    def fit(self, X, y=None):
+        return self
+
+    def sample(self):
+        return None
+
+
+def test_distribution_estimator_without_sample_method(X):
+    model = SyntheticData(distribution_estimator=_NoSampleEstimator())
+    with pytest.raises(ValueError, match="must implement a `sample` method"):
+        model.fit(X)
+
+
+def test_distribution_estimator_sample_without_n_samples(X):
+    model = SyntheticData(distribution_estimator=_SampleWithoutNSamplesEstimator())
+    with pytest.raises(ValueError, match="must have `n_samples` as parameter"):
+        model.fit(X)
+
+
+class _WeightedGaussianEstimator(skb.BaseEstimator):
+    def fit(self, X, y=None, sample_weight=None):
+        X = np.asarray(X)
+        self.sample_weight_ = sample_weight
+        self.mean_ = np.average(X, axis=0, weights=sample_weight)
+        self.covariance_ = np.cov(X, rowvar=False, aweights=sample_weight)
+        return self
+
+    def sample(self, n_samples=1):
+        rng = np.random.default_rng(42)
+        return rng.multivariate_normal(self.mean_, self.covariance_, size=n_samples)
+
+
+def test_metadata_routing(X):
+    X = X.iloc[-300:]
+    sample_weight = np.linspace(0.5, 1.5, len(X))
+    with config_context(enable_metadata_routing=True):
+        model = SyntheticData(
+            distribution_estimator=_WeightedGaussianEstimator().set_fit_request(
+                sample_weight=True
+            )
+        )
+        model.fit(X, sample_weight=sample_weight)
+
+    np.testing.assert_array_equal(
+        model.distribution_estimator_.sample_weight_, sample_weight
+    )
+    assert model.return_distribution_.returns.shape == (1000, 20)
