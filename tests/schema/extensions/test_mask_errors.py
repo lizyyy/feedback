@@ -1,0 +1,316 @@
+from unittest.mock import Mock
+
+import pytest
+from graphql.error import GraphQLError
+
+import strawberry
+from strawberry.extensions import MaskErrors, ValidationCache
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "query { testField( }",
+        "query { missingField }",
+    ],
+)
+def test_mask_pre_execution_errors_sync(query: str):
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def test_field(self) -> str:
+            return "TestField"
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[ValidationCache, MaskErrors],
+    )
+
+    result = schema.execute_sync(query)
+
+    assert result.data is None
+    assert result.errors is not None
+    assert [error.message for error in result.errors] == ["Unexpected error."]
+
+
+def test_mask_cached_validation_errors_sync():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def test_field(self) -> str:
+            return "TestField"
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[ValidationCache, MaskErrors],
+    )
+
+    query = "query { missingField }"
+    results = (schema.execute_sync(query), schema.execute_sync(query))
+
+    for result in results:
+        assert result.data is None
+        assert result.errors is not None
+        assert [error.message for error in result.errors] == ["Unexpected error."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "query { testField( }",
+        "query { missingField }",
+    ],
+)
+async def test_mask_pre_execution_errors_async(query: str):
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def test_field(self) -> str:
+            return "TestField"
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[ValidationCache, MaskErrors],
+    )
+
+    result = await schema.execute(query)
+
+    assert result.data is None
+    assert result.errors is not None
+    assert [error.message for error in result.errors] == ["Unexpected error."]
+
+
+def test_mask_all_errors():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def hidden_error(self) -> str:
+            raise KeyError("This error is not visible")
+
+    schema = strawberry.Schema(query=Query, extensions=[MaskErrors])
+
+    query = "query { hiddenError }"
+
+    result = schema.execute_sync(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["hiddenError"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mask_all_errors_async():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def hidden_error(self) -> str:
+            raise KeyError("This error is not visible")
+
+    schema = strawberry.Schema(query=Query, extensions=[MaskErrors])
+
+    query = "query { hiddenError }"
+
+    result = await schema.execute(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["hiddenError"],
+        }
+    ]
+
+
+def test_mask_some_errors():
+    class VisibleError(Exception):
+        pass
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def visible_error(self) -> str:
+            raise VisibleError("This error is visible")
+
+        @strawberry.field
+        def hidden_error(self) -> str:
+            raise Exception("This error is not visible")
+
+    def should_mask_error(error: GraphQLError) -> bool:
+        original_error = error.original_error
+        return not (original_error and isinstance(original_error, VisibleError))
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[lambda: MaskErrors(should_mask_error=should_mask_error)],
+    )
+
+    query = "query { hiddenError }"
+
+    result = schema.execute_sync(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["hiddenError"],
+        }
+    ]
+
+    query = "query { visibleError }"
+
+    result = schema.execute_sync(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "This error is visible",
+            "path": ["visibleError"],
+        }
+    ]
+
+
+def test_process_errors_original_error():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def hidden_error(self) -> str:
+            raise ValueError("This error is not visible")
+
+    mock_process_error = Mock()
+
+    class CustomSchema(strawberry.Schema):
+        def process_errors(self, errors, execution_context):
+            for error in errors:
+                mock_process_error(error)
+
+    schema = CustomSchema(query=Query, extensions=[MaskErrors])
+
+    query = "query { hiddenError }"
+
+    result = schema.execute_sync(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["hiddenError"],
+        }
+    ]
+
+    assert mock_process_error.call_count == 1
+    call = mock_process_error.call_args_list[0]
+    assert call[0][0].message == "This error is not visible"
+    assert isinstance(call[0][0].original_error, ValueError)
+
+
+def test_graphql_error_masking():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def graphql_error(self) -> str:
+            return None  # type: ignore
+
+    schema = strawberry.Schema(query=Query, extensions=[MaskErrors])
+
+    query = "query { graphqlError }"
+
+    result = schema.execute_sync(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["graphqlError"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mask_errors_with_strawberry_execution_result_async():
+    """Test that MaskErrors works correctly with async execution (which returns StrawberryExecutionResult)."""
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def test_field(self) -> str:
+            raise ValueError("Original error message")
+
+    schema = strawberry.Schema(query=Query, extensions=[MaskErrors])
+
+    query = "query { testField }"
+
+    # Use async execution to ensure we get StrawberryExecutionResult path
+    result = await schema.execute(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["testField"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mask_errors_selective_async():
+    """Test selective error masking with async execution."""
+
+    class VisibleError(Exception):
+        pass
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def visible_error(self) -> str:
+            raise VisibleError("This error is visible")
+
+        @strawberry.field
+        def hidden_error(self) -> str:
+            raise ValueError("This error is not visible")
+
+    def should_mask_error(error: GraphQLError) -> bool:
+        original_error = error.original_error
+        return not (original_error and isinstance(original_error, VisibleError))
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[lambda: MaskErrors(should_mask_error=should_mask_error)],
+    )
+
+    # Test hidden error
+    query = "query { hiddenError }"
+    result = await schema.execute(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "Unexpected error.",
+            "path": ["hiddenError"],
+        }
+    ]
+
+    # Test visible error
+    query = "query { visibleError }"
+    result = await schema.execute(query)
+    assert result.errors is not None
+    formatted_errors = [err.formatted for err in result.errors]
+    assert formatted_errors == [
+        {
+            "locations": [{"column": 9, "line": 1}],
+            "message": "This error is visible",
+            "path": ["visibleError"],
+        }
+    ]

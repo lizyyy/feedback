@@ -1,0 +1,141 @@
+import re
+import textwrap
+
+import pytest
+
+import strawberry
+from strawberry.exceptions import InvalidSuperclassInterfaceError
+from strawberry.printer import print_schema
+
+
+def test_renaming_input_fields():
+    @strawberry.input
+    class FilterInput:
+        in_: str | None = strawberry.field(name="in", default=strawberry.UNSET)
+
+    @strawberry.type
+    class Query:
+        hello: str = "Hello"
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        def filter(self, input: FilterInput) -> str:
+            return f"Hello {input.in_ or 'nope'}"
+
+    schema = strawberry.Schema(query=Query, mutation=Mutation)
+
+    query = "mutation { filter(input: {}) }"
+
+    result = schema.execute_sync(query)
+
+    assert not result.errors
+    assert result.data
+    assert result.data["filter"] == "Hello nope"
+
+
+def test_input_with_nonscalar_field_default():
+    @strawberry.input
+    class NonScalarField:
+        id: int = 10
+        nullable_field: int | None = None
+
+    @strawberry.input
+    class Input:
+        non_scalar_field: NonScalarField = strawberry.field(
+            default_factory=NonScalarField
+        )
+        id: int = 10
+
+    @strawberry.type
+    class ExampleOutput:
+        input_id: int
+        non_scalar_id: int
+        non_scalar_nullable_field: int | None
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def example(self, data: Input) -> ExampleOutput:
+            return ExampleOutput(
+                input_id=data.id,
+                non_scalar_id=data.non_scalar_field.id,
+                non_scalar_nullable_field=data.non_scalar_field.nullable_field,
+            )
+
+    schema = strawberry.Schema(query=Query)
+
+    expected = """
+    type ExampleOutput {
+      inputId: Int!
+      nonScalarId: Int!
+      nonScalarNullableField: Int
+    }
+
+    input Input {
+      nonScalarField: NonScalarField! = { id: 10 }
+      id: Int! = 10
+    }
+
+    input NonScalarField {
+      id: Int! = 10
+      nullableField: Int = null
+    }
+
+    type Query {
+      example(data: Input!): ExampleOutput!
+    }
+    """
+    assert print_schema(schema) == textwrap.dedent(expected).strip()
+
+    query = """
+    query($input_data: Input!)
+    {
+        example(data: $input_data) {
+            inputId nonScalarId nonScalarNullableField
+        }
+    }
+    """
+    result = schema.execute_sync(
+        query, variable_values={"input_data": {"nonScalarField": {}}}
+    )
+
+    assert not result.errors
+    expected_result = {"inputId": 10, "nonScalarId": 10, "nonScalarNullableField": None}
+    assert result.data["example"] == expected_result
+
+
+@pytest.mark.raises_strawberry_exception(
+    InvalidSuperclassInterfaceError,
+    match=re.escape(
+        "Input class 'SomeInput' cannot inherit from interface(s): SomeInterface"
+    ),
+)
+def test_input_cannot_inherit_from_interface():
+    @strawberry.interface
+    class SomeInterface:
+        some_arg: str
+
+    @strawberry.input
+    class SomeInput(SomeInterface):
+        another_arg: str
+
+
+@pytest.mark.raises_strawberry_exception(
+    InvalidSuperclassInterfaceError,
+    match=re.escape(
+        "Input class 'SomeOtherInput' cannot inherit from interface(s): SomeInterface, SomeOtherInterface"
+    ),
+)
+def test_input_cannot_inherit_from_interfaces():
+    @strawberry.interface
+    class SomeInterface:
+        some_arg: str
+
+    @strawberry.interface
+    class SomeOtherInterface:
+        some_other_arg: str
+
+    @strawberry.input
+    class SomeOtherInput(SomeInterface, SomeOtherInterface):
+        another_arg: str

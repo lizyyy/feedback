@@ -1,0 +1,759 @@
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from textwrap import dedent
+from typing import Any
+from uuid import UUID
+
+import pytest
+
+import strawberry
+from strawberry import scalar
+from strawberry.exceptions import ScalarAlreadyRegisteredError
+from strawberry.scalars import JSON, Base16, Base32, Base64
+
+
+def test_void_function():
+    NoneType = type(None)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def void_ret(self) -> None:
+            return
+
+        @strawberry.field
+        def void_ret_crash(self) -> NoneType:
+            return 1
+
+        @strawberry.field
+        def void_arg(self, x: None) -> None:
+            return
+
+    schema = strawberry.Schema(query=Query)
+
+    assert (
+        str(schema)
+        == dedent(
+            '''
+      type Query {
+        voidRet: Void
+        voidRetCrash: Void
+        voidArg(x: Void): Void
+      }
+
+      """Represents NULL values"""
+      scalar Void
+    '''
+        ).strip()
+    )
+
+    result = schema.execute_sync("query { voidRet }")
+    assert not result.errors
+    assert result.data == {
+        "voidRet": None,
+    }
+
+    result = schema.execute_sync("query { voidArg (x: null) }")
+    assert not result.errors
+    assert result.data == {
+        "voidArg": None,
+    }
+
+    result = schema.execute_sync("query { voidArg (x: 1) }")
+    assert result.errors
+
+    result = schema.execute_sync("query { voidRetCrash }")
+    assert result.errors
+
+
+def test_uuid_field_string_value():
+    @strawberry.type
+    class Query:
+        unique_id: UUID
+
+    schema = strawberry.Schema(query=Query)
+
+    assert (
+        str(schema)
+        == dedent(
+            """
+      type Query {
+        uniqueId: UUID!
+      }
+
+      scalar UUID
+    """
+        ).strip()
+    )
+
+    result = schema.execute_sync(
+        "query { uniqueId }",
+        root_value=Query(
+            unique_id="e350746c-33b6-4469-86b0-5f16e1e12232",
+        ),
+    )
+    assert not result.errors
+    assert result.data == {
+        "uniqueId": "e350746c-33b6-4469-86b0-5f16e1e12232",
+    }
+
+
+def test_uuid_field_uuid_value():
+    @strawberry.type
+    class Query:
+        unique_id: UUID
+
+    schema = strawberry.Schema(query=Query)
+
+    assert (
+        str(schema)
+        == dedent(
+            """
+      type Query {
+        uniqueId: UUID!
+      }
+
+      scalar UUID
+    """
+        ).strip()
+    )
+
+    result = schema.execute_sync(
+        "query { uniqueId }",
+        root_value=Query(
+            unique_id=UUID("e350746c-33b6-4469-86b0-5f16e1e12232"),
+        ),
+    )
+    assert not result.errors
+    assert result.data == {
+        "uniqueId": "e350746c-33b6-4469-86b0-5f16e1e12232",
+    }
+
+
+def test_uuid_input():
+    @strawberry.type
+    class Query:
+        ok: bool
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        def uuid_input(self, input_id: UUID) -> str:
+            assert isinstance(input_id, UUID)
+            return str(input_id)
+
+    schema = strawberry.Schema(query=Query, mutation=Mutation)
+
+    result = schema.execute_sync(
+        """
+        mutation {
+            uuidInput(inputId: "e350746c-33b6-4469-86b0-5f16e1e12232")
+        }
+    """
+    )
+
+    assert not result.errors
+    assert result.data == {
+        "uuidInput": "e350746c-33b6-4469-86b0-5f16e1e12232",
+    }
+
+
+def test_json():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def echo_json(data: JSON) -> JSON:
+            return data
+
+        @strawberry.field
+        def echo_json_nullable(data: JSON | None) -> JSON | None:
+            return data
+
+    schema = strawberry.Schema(query=Query)
+
+    expected_schema = dedent(
+        '''
+        """
+        The `JSON` scalar type represents JSON values as specified by [ECMA-404](https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf).
+        """
+        scalar JSON @specifiedBy(url: "https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf")
+
+        type Query {
+          echoJson(data: JSON!): JSON!
+          echoJsonNullable(data: JSON): JSON
+        }
+        '''
+    ).strip()
+
+    assert str(schema) == expected_schema
+
+    result = schema.execute_sync(
+        """
+        query {
+            echoJson(data: {hello: {a: 1}, someNumbers: [1, 2, 3], null: null})
+            echoJsonNullable(data: {hello: {a: 1}, someNumbers: [1, 2, 3], null: null})
+        }
+    """
+    )
+
+    assert not result.errors
+    assert result.data == {
+        "echoJson": {"hello": {"a": 1}, "someNumbers": [1, 2, 3], "null": None},
+        "echoJsonNullable": {"hello": {"a": 1}, "someNumbers": [1, 2, 3], "null": None},
+    }
+
+    result = schema.execute_sync(
+        """
+        query {
+            echoJson(data: null)
+        }
+    """
+    )
+    assert result.errors  # echoJson is not-null null
+
+    result = schema.execute_sync(
+        """
+        query {
+            echoJsonNullable(data: null)
+        }
+    """
+    )
+    assert not result.errors
+    assert result.data == {
+        "echoJsonNullable": None,
+    }
+
+
+def test_base16():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def base16_encode(data: str) -> Base16:
+            return bytes(data, "utf-8")
+
+        @strawberry.field
+        def base16_decode(data: Base16) -> str:
+            return data.decode("utf-8")
+
+        @strawberry.field
+        def base32_encode(data: str) -> Base32:
+            return bytes(data, "utf-8")
+
+        @strawberry.field
+        def base32_decode(data: Base32) -> str:
+            return data.decode("utf-8")
+
+        @strawberry.field
+        def base64_encode(data: str) -> Base64:
+            return bytes(data, "utf-8")
+
+        @strawberry.field
+        def base64_decode(data: Base64) -> str:
+            return data.decode("utf-8")
+
+    schema = strawberry.Schema(query=Query)
+
+    assert (
+        str(schema)
+        == dedent(
+            '''
+        """Represents binary data as Base16-encoded (hexadecimal) strings."""
+        scalar Base16 @specifiedBy(url: "https://datatracker.ietf.org/doc/html/rfc4648.html#section-8")
+
+        """
+        Represents binary data as Base32-encoded strings, using the standard alphabet.
+        """
+        scalar Base32 @specifiedBy(url: "https://datatracker.ietf.org/doc/html/rfc4648.html#section-6")
+
+        """
+        Represents binary data as Base64-encoded strings, using the standard alphabet.
+        """
+        scalar Base64 @specifiedBy(url: "https://datatracker.ietf.org/doc/html/rfc4648.html#section-4")
+
+        type Query {
+          base16Encode(data: String!): Base16!
+          base16Decode(data: Base16!): String!
+          base32Encode(data: String!): Base32!
+          base32Decode(data: Base32!): String!
+          base64Encode(data: String!): Base64!
+          base64Decode(data: Base64!): String!
+        }
+    '''
+        ).strip()
+    )
+
+    result = schema.execute_sync(
+        """
+        query {
+            base16Encode(data: "Hello")
+            base16Decode(data: "48656c6C6f")  # < Mix lowercase and uppercase
+            base32Encode(data: "Hello")
+            base32Decode(data: "JBSWY3dp")  # < Mix lowercase and uppercase
+            base64Encode(data: "Hello")
+            base64Decode(data: "SGVsbG8=")
+        }
+    """
+    )
+
+    assert not result.errors
+    assert result.data == {
+        "base16Encode": "48656C6C6F",
+        "base16Decode": "Hello",
+        "base32Encode": "JBSWY3DP",
+        "base32Decode": "Hello",
+        "base64Encode": "SGVsbG8=",
+        "base64Decode": "Hello",
+    }
+
+
+def test_override_built_in_scalars():
+    EpochDateTime = strawberry.scalar(
+        datetime,
+        serialize=lambda value: int(value.timestamp()),
+        parse_value=lambda value: datetime.fromtimestamp(int(value), timezone.utc),
+    )
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def current_time(self) -> datetime:
+            return datetime(2021, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+        @strawberry.field
+        def isoformat(self, input_datetime: datetime) -> str:
+            return input_datetime.isoformat()
+
+    schema = strawberry.Schema(
+        Query,
+        scalar_overrides={
+            datetime: EpochDateTime,
+        },
+    )
+
+    result = schema.execute_sync(
+        """
+        {
+            currentTime
+            isoformat(inputDatetime: 1628683200)
+        }
+        """
+    )
+
+    assert not result.errors
+    assert result.data["currentTime"] == 1628683200
+    assert result.data["isoformat"] == "2021-08-11T12:00:00+00:00"
+
+
+def test_override_unknown_scalars():
+    Duration = strawberry.scalar(
+        timedelta,
+        name="Duration",
+        serialize=timedelta.total_seconds,
+        parse_value=lambda s: timedelta(seconds=s),
+    )
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def duration(self, value: timedelta) -> timedelta:
+            return value
+
+    schema = strawberry.Schema(Query, scalar_overrides={timedelta: Duration})
+
+    result = schema.execute_sync("{ duration(value: 10) }")
+
+    assert not result.errors
+    assert result.data == {"duration": 10}
+
+
+def test_override_generic_container_by_origin():
+    # Registering the bare ``dict`` should cover every ``dict[K, V]``
+    # parameterization instead of requiring one override entry per variant.
+    JSONScalar = scalar(
+        dict,
+        name="JSON",
+        serialize=lambda value: value,
+        parse_value=lambda value: value,
+    )
+
+    @strawberry.type
+    class Query:
+        ints: dict[str, int]
+        nested: dict[str, list[int]]
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        def echo(self, value: dict[str, int]) -> dict[str, int]:
+            return value
+
+        @strawberry.mutation
+        def echo_optional(
+            self, value: dict[str, int] | None = None
+        ) -> dict[str, int] | None:
+            return value
+
+        @strawberry.mutation
+        def echo_list(self, value: list[dict[str, int]]) -> list[dict[str, int]]:
+            return value
+
+    schema = strawberry.Schema(
+        Query,
+        mutation=Mutation,
+        scalar_overrides={dict: JSONScalar},
+    )
+
+    assert "ints: JSON!" in str(schema)
+    assert "nested: JSON!" in str(schema)
+
+    result = schema.execute_sync(
+        "{ ints nested }",
+        root_value=Query(ints={"a": 1}, nested={"b": [2]}),
+    )
+
+    assert not result.errors
+    assert result.data == {"ints": {"a": 1}, "nested": {"b": [2]}}
+
+    result = schema.execute_sync(
+        "mutation($value: JSON!) { echo(value: $value) }",
+        variable_values={"value": {"a": 1}},
+    )
+
+    assert not result.errors
+    assert result.data == {"echo": {"a": 1}}
+
+    result = schema.execute_sync(
+        "mutation($value: JSON) { echoOptional(value: $value) }",
+        variable_values={"value": {"b": 2}},
+    )
+
+    assert not result.errors
+    assert result.data == {"echoOptional": {"b": 2}}
+
+    result = schema.execute_sync(
+        "mutation($value: [JSON!]!) { echoList(value: $value) }",
+        variable_values={"value": [{"c": 3}]},
+    )
+
+    assert not result.errors
+    assert result.data == {"echoList": [{"c": 3}]}
+
+
+def test_override_exact_generic_key_still_matches():
+    JSONScalar = scalar(
+        dict,
+        name="JSON",
+        serialize=lambda value: value,
+        parse_value=lambda value: value,
+    )
+
+    @strawberry.type
+    class Query:
+        settings: dict[str, Any]
+
+    schema = strawberry.Schema(Query, scalar_overrides={dict[str, Any]: JSONScalar})
+
+    assert "settings: JSON!" in str(schema)
+
+
+def test_override_exact_generic_key_does_not_match_other_parameterizations():
+    JSONScalar = scalar(
+        dict,
+        name="JSON",
+        serialize=lambda value: value,
+        parse_value=lambda value: value,
+    )
+
+    @strawberry.type
+    class Query:
+        settings: dict[str, Any]
+        other: dict[str, int]
+
+    with pytest.raises(TypeError, match="Unexpected type 'dict\\[str, int\\]'"):
+        strawberry.Schema(Query, scalar_overrides={dict[str, Any]: JSONScalar})
+
+
+def test_decimal():
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def decimal(value: Decimal) -> Decimal:
+            return value
+
+    schema = strawberry.Schema(query=Query)
+
+    result = schema.execute_sync(
+        """
+        query {
+            floatDecimal: decimal(value: 3.14)
+            floatDecimal2: decimal(value: 3.14509999)
+            floatDecimal3: decimal(value: 0.000001)
+            stringDecimal: decimal(value: "3.14")
+            stringDecimal2: decimal(value: "3.1499999991")
+        }
+    """
+    )
+
+    assert not result.errors
+    assert result.data == {
+        "floatDecimal": "3.14",
+        "floatDecimal2": "3.14509999",
+        "floatDecimal3": "0.000001",
+        "stringDecimal": "3.14",
+        "stringDecimal2": "3.1499999991",
+    }
+
+
+@pytest.mark.raises_strawberry_exception(
+    ScalarAlreadyRegisteredError,
+    match="Scalar `MyCustomScalar` has already been registered",
+)
+def test_duplicate_scalars_raises_exception():
+    MyCustomScalar = strawberry.scalar(
+        str,
+        name="MyCustomScalar",
+    )
+
+    MyCustomScalar2 = strawberry.scalar(
+        int,
+        name="MyCustomScalar",
+    )
+
+    @strawberry.type
+    class Query:
+        scalar_1: MyCustomScalar
+        scalar_2: MyCustomScalar2
+
+    strawberry.Schema(Query)
+
+
+@pytest.mark.raises_strawberry_exception(
+    ScalarAlreadyRegisteredError,
+    match="Scalar `MyCustomScalar` has already been registered",
+)
+def test_duplicate_scalars_raises_exception_using_alias():
+    MyCustomScalar = scalar(
+        str,
+        name="MyCustomScalar",
+    )
+
+    MyCustomScalar2 = scalar(
+        int,
+        name="MyCustomScalar",
+    )
+
+    @strawberry.type
+    class Query:
+        scalar_1: MyCustomScalar
+        scalar_2: MyCustomScalar2
+
+    strawberry.Schema(Query)
+
+
+def test_optional_scalar_with_or_operator():
+    """Check `|` operator support with an optional scalar."""
+
+    @strawberry.type
+    class Query:
+        date: date | None
+
+    schema = strawberry.Schema(query=Query)
+
+    query = "{ date }"
+
+    result = schema.execute_sync(query, root_value=Query(date=None))
+    assert not result.errors
+    assert result.data["date"] is None
+
+    result = schema.execute_sync(query, root_value=Query(date=date(2020, 1, 1)))
+    assert not result.errors
+    assert result.data["date"] == "2020-01-01"
+
+
+def test_scalar_map_with_newtype():
+    """Test scalar_map configuration with NewType."""
+    from typing import NewType
+
+    from strawberry.schema.config import StrawberryConfig
+
+    MyString = NewType("MyString", str)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def my_string(self) -> MyString:
+            return MyString("hello")
+
+        @strawberry.field
+        def process_string(self, value: MyString) -> str:
+            return f"processed: {value}"
+
+    schema = strawberry.Schema(
+        query=Query,
+        config=StrawberryConfig(
+            scalar_map={
+                MyString: strawberry.scalar(
+                    name="MyString",
+                    description="A custom string scalar",
+                    serialize=lambda v: v.upper(),
+                    parse_value=lambda v: v.lower(),
+                )
+            }
+        ),
+    )
+
+    expected_schema = dedent(
+        '''
+        """A custom string scalar"""
+        scalar MyString
+
+        type Query {
+          myString: MyString!
+          processString(value: MyString!): String!
+        }
+        '''
+    ).strip()
+
+    assert str(schema) == expected_schema
+
+    result = schema.execute_sync("{ myString }")
+    assert not result.errors
+    assert result.data == {"myString": "HELLO"}
+
+    result = schema.execute_sync('{ processString(value: "WORLD") }')
+    assert not result.errors
+    assert result.data == {"processString": "processed: world"}
+
+
+def test_scalar_map_override_builtin():
+    """Test scalar_map can override built-in scalars."""
+    from strawberry.schema.config import StrawberryConfig
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def current_time(self) -> datetime:
+            return datetime(2021, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+        @strawberry.field
+        def parse_time(self, value: datetime) -> str:
+            return value.isoformat()
+
+    schema = strawberry.Schema(
+        query=Query,
+        config=StrawberryConfig(
+            scalar_map={
+                datetime: strawberry.scalar(
+                    name="DateTime",
+                    serialize=lambda v: int(v.timestamp()),
+                    parse_value=lambda v: datetime.fromtimestamp(int(v), timezone.utc),
+                )
+            }
+        ),
+    )
+
+    result = schema.execute_sync("{ currentTime parseTime(value: 1628683200) }")
+    assert not result.errors
+    assert result.data["currentTime"] == 1628683200
+    assert result.data["parseTime"] == "2021-08-11T12:00:00+00:00"
+
+
+def test_scalar_map_with_specified_by_url():
+    """Test scalar_map with specified_by_url."""
+    from typing import NewType
+
+    from strawberry.schema.config import StrawberryConfig
+
+    Email = NewType("Email", str)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def email(self) -> Email:
+            return Email("test@example.com")
+
+    schema = strawberry.Schema(
+        query=Query,
+        config=StrawberryConfig(
+            scalar_map={
+                Email: strawberry.scalar(
+                    name="Email",
+                    description="An email address",
+                    specified_by_url="https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address",
+                )
+            }
+        ),
+    )
+
+    expected = 'scalar Email @specifiedBy(url: "https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address")'
+    assert expected in str(schema)
+
+
+def test_scalar_map_combined_with_scalar_overrides():
+    """Test that scalar_map and scalar_overrides work together."""
+    import warnings
+    from typing import NewType
+
+    from strawberry.schema.config import StrawberryConfig
+
+    MyInt = NewType("MyInt", int)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        MyFloat = strawberry.scalar(
+            float,
+            name="MyFloat",
+            serialize=lambda v: round(v, 2),
+        )
+
+    @strawberry.type
+    class Query:
+        my_int: MyInt
+        my_float: MyFloat
+
+    schema = strawberry.Schema(
+        query=Query,
+        config=StrawberryConfig(
+            scalar_map={
+                MyInt: strawberry.scalar(
+                    name="MyInt",
+                    serialize=lambda v: v * 2,
+                )
+            }
+        ),
+        scalar_overrides={
+            float: MyFloat,
+        },
+    )
+
+    result = schema.execute_sync(
+        "{ myInt myFloat }", root_value=Query(my_int=5, my_float=3.14159)
+    )
+    assert not result.errors
+    assert result.data == {"myInt": 10, "myFloat": 3.14}
+
+
+def test_scalar_definition_direct_creation():
+    """Test creating ScalarDefinition directly via scalar()."""
+    definition = strawberry.scalar(
+        name="TestScalar",
+        description="A test scalar",
+        serialize=str,
+        parse_value=int,
+    )
+
+    assert definition.name == "TestScalar"
+    assert definition.description == "A test scalar"
+    assert definition.serialize is not None
+    assert definition.parse_value is not None
+
+
+def test_builtin_scalars_are_newtypes():
+    """Test that built-in scalars are proper NewType instances."""
+    from strawberry.scalars import ID, JSON, Base16, Base32, Base64
+
+    assert ID.__supertype__ is str
+    assert JSON.__supertype__ is object
+    assert Base16.__supertype__ is bytes
+    assert Base32.__supertype__ is bytes
+    assert Base64.__supertype__ is bytes

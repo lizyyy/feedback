@@ -1,0 +1,52 @@
+# .coveragerc to control coverage.py
+[run]
+branch = True
+
+[paths]
+source =
+    strawberry/
+    tests/
+    D:/a/strawberry/strawberry/strawberry/
+    D:/a/strawberry/strawberry/tests/
+
+[report]
+# Regexes for lines to exclude from consideration
+exclude_lines =
+    # Have to re-enable the standard pragma
+    pragma: no cover
+
+    # Don't complain about missing debug-only code:
+    def __repr__
+    if self\.debug
+
+    # Don't complain if tests don't hit defensive assertion code:
+    raise AssertionError
+    raise NotImplementedError
+    raise UnsupportedTypeError
+
+    # Don't complain if non-runnable code isn't run:
+    if 0:
+    if __name__ == .__main__.:
+
+    # Don't complain about abstract methods, they aren't run:
+    @(abc\.)?abstractmethod
+
+    # Don't complain about TYPE_CHECKING
+    if TYPE_CHECKING:
+
+    @overload
+
+    # Those are not supposed to be hit
+    assert_never\(\w+\)
+
+ignore_errors = True
+
+omit =
+  ./.venv/**
+  noxfile.py
+  strawberry/ext/mypy_plugin.py
+  setup.py
+  strawberry/experimental/pydantic/conversion_types.py
+
+[html]
+directory = coverage_html_report
