@@ -1,0 +1,110 @@
+from unittest import mock
+
+import pytest
+
+from briefcase.config import DraftAppConfig
+from briefcase.integrations.gnupg import GnuPG
+from briefcase.platforms.linux.system import LinuxSystemCreateCommand
+
+from ....utils import create_file
+
+
+@pytest.fixture
+def mock_gpg(mock_tools):
+    """Adds a mocked GnuPG tool to the mock_tools, with no identities by default."""
+    mock_tools.gnupg = mock.MagicMock(spec_set=GnuPG)
+    mock_tools.gnupg.identities.return_value = {}
+    return mock_tools.gnupg
+
+
+@pytest.fixture
+def create_command(dummy_console, tmp_path):
+    return LinuxSystemCreateCommand(
+        console=dummy_console,
+        base_path=tmp_path / "base_path",
+        data_path=tmp_path / "briefcase",
+    )
+
+
+@pytest.fixture
+def first_app(first_app_config, tmp_path):
+    """A fixture for the first app, rolled out on disk."""
+    # Specify a system python app for a dummy vendor
+    first_app_config.target_vendor = "somevendor"
+    first_app_config.target_codename = "surprising"
+    first_app_config.target_vendor_base = "basevendor"
+
+    # Targeted Python version
+    first_app_config.python_version_tag = "3"
+
+    # Some project-level files.
+    create_file(tmp_path / "base_path/CHANGELOG", "First App Changelog")
+
+    # Make it look like the template has been generated
+    bundle_dir = tmp_path / "base_path/build/first-app/somevendor/surprising"
+
+    create_file(bundle_dir / "first-app.1", "First App manpage")
+
+    lib_dir = bundle_dir / "first-app-0.0.1/usr/lib/first-app"
+    (lib_dir / "app").mkdir(parents=True, exist_ok=True)
+    (lib_dir / "app_packages/firstlib").mkdir(parents=True, exist_ok=True)
+    (lib_dir / "app_packages/secondlib").mkdir(parents=True, exist_ok=True)
+
+    # Create some .so files
+    # An SO file with different group and world permissions
+    (lib_dir / "app/support.so").touch()
+    (lib_dir / "app/support.so").chmod(0o775)
+
+    # An SO file with same group and world permissions
+    (lib_dir / "app/support_same_perms.so").touch()
+    (lib_dir / "app/support_same_perms.so").chmod(0o744)
+
+    # A SO file with both .so and .so.1.0 forms
+    (lib_dir / "app_packages/firstlib/first.so").touch()
+    (lib_dir / "app_packages/firstlib/first.so.1.0").touch()
+
+    # An SO file with 664 permissions
+    (lib_dir / "app_packages/secondlib/second_a.so").touch()
+    (lib_dir / "app_packages/secondlib/second_a.so").chmod(0o664)
+
+    (lib_dir / "app_packages/secondlib/second_b.so").touch()
+
+    return first_app_config
+
+
+@pytest.fixture
+def underscore_app(tmp_path):
+    """A fixture for an app with an underscore in the name, rolled out on disk."""
+    app_config = DraftAppConfig(
+        app_name="underscore_app",
+        project_name="Underscore Project",
+        formal_name="Underscore App",
+        author="Megacorp",
+        author_email="maintainer@example.com",
+        url="https://example.com/underscore_app",
+        bundle="com.example",
+        version="0.0.1",
+        description="The first simple app \\ demonstration",
+        sources=["src/underscore_app"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+    # Specify a system python app for a dummy vendor
+    app_config.target_vendor = "somevendor"
+    app_config.target_codename = "surprising"
+    app_config.target_vendor_base = "basevendor"
+
+    # Targeted Python version
+    app_config.python_version_tag = "3"
+
+    # Some project-level files.
+    create_file(tmp_path / "base_path/LICENSE", "Underscore App License")
+    create_file(tmp_path / "base_path/CHANGELOG", "Underscore App Changelog")
+
+    # Make it look like the template has been generated
+    bundle_dir = tmp_path / "base_path/build/underscore_app/somevendor/surprising"
+
+    lib_dir = bundle_dir / "underscore_app-0.0.1/usr/lib/underscore_app"
+    (lib_dir / "app").mkdir(parents=True, exist_ok=True)
+
+    return app_config

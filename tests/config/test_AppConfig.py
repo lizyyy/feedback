@@ -1,0 +1,582 @@
+import sys
+
+import pytest
+from packaging.version import Version
+
+from briefcase.config import DraftAppConfig
+from briefcase.exceptions import BriefcaseConfigError
+
+from .test_GlobalConfig import INVALID_VERSIONS, VALID_VERSIONS
+
+
+def test_minimal_AppConfig():
+    """A simple config can be defined."""
+    config = DraftAppConfig(
+        app_name="myapp",
+        version="1.2.3",
+        bundle="org.beeware",
+        description="A simple app",
+        sources=["src/myapp", "somewhere/else/interesting", "local_app"],
+    )
+
+    # The basic properties have been set.
+    assert config.app_name == "myapp"
+    assert config.version == Version("1.2.3")
+    assert config.bundle == "org.beeware"
+    assert config.description == "A simple app"
+    assert config.requires is None
+    assert config.sources == ["src/myapp", "somewhere/else/interesting", "local_app"]
+    assert config.external_package_path is None
+    assert config.external_package_executable_path is None
+    assert config.license is None
+    assert config.license_files == []
+
+    # Derived properties have been set.
+    assert config.bundle_name == "myapp"
+    assert config.bundle_identifier == "org.beeware.myapp"
+    assert config.formal_name == "myapp"
+    assert config.class_name == "myapp"
+    assert config.document_types == {}
+    assert config.env_manager == "venv"
+
+    # There is no icon of any kind
+    assert config.icon is None
+
+    # The PYTHONPATH is derived correctly
+    config.test_mode = False
+    assert config.PYTHONPATH() == ["src", "somewhere/else", ""]
+    # The test mode PYTHONPATH is the same
+    config.test_mode = True
+    assert config.PYTHONPATH() == ["src", "somewhere/else", ""]
+
+    # The object has a meaningful REPL
+    assert repr(config) == "<org.beeware.myapp v1.2.3 DraftAppConfig>"
+
+
+def test_minimal_external_AppConfig():
+    """A simple config for an external app can be defined."""
+    config = DraftAppConfig(
+        app_name="myapp",
+        version="1.2.3",
+        bundle="org.beeware",
+        description="A simple app",
+        external_package_path="path/to/package",
+        external_package_executable_path="internal/app.exe",
+    )
+
+    # The basic properties have been set.
+    assert config.app_name == "myapp"
+    assert config.version == Version("1.2.3")
+    assert config.bundle == "org.beeware"
+    assert config.description == "A simple app"
+    assert config.requires is None
+    assert config.sources is None
+    assert config.license is None
+    assert config.license_files == []
+    assert config.external_package_path == "path/to/package"
+    assert config.external_package_executable_path == "internal/app.exe"
+
+    # Derived properties have been set.
+    assert config.bundle_name == "myapp"
+    assert config.bundle_identifier == "org.beeware.myapp"
+    assert config.formal_name == "myapp"
+    assert config.class_name == "myapp"
+    assert config.document_types == {}
+    assert config.env_manager == "venv"
+
+    # There is no icon of any kind
+    assert config.icon is None
+
+    # The PYTHONPATH is derived correctly
+    config.test_mode = False
+    assert config.PYTHONPATH() == []
+    # The test mode PYTHONPATH is the same
+    config.test_mode = True
+    assert config.PYTHONPATH() == []
+
+    # The object has a meaningful REPL
+    assert repr(config) == "<org.beeware.myapp v1.2.3 DraftAppConfig>"
+
+
+def test_extra_attrs():
+    """A config can contain attributes in addition to those required."""
+    config = DraftAppConfig(
+        app_name="myapp",
+        formal_name="My App!",
+        version="1.2.3",
+        bundle="org.beeware",
+        description="A simple app",
+        long_description="A longer description\nof the app",
+        license="MIT",
+        license_files=["LICENSE"],
+        template="/path/to/template",
+        sources=["src/myapp"],
+        requires=["first", "second", "third"],
+        env_manager="venv",
+        document_type={
+            "document": {
+                "icon": "icon",
+                "extension": "doc",
+                "description": "A document",
+                "url": "https://testurl.com",
+                "mime_type": "application/x-my-doc-type",
+            }
+        },
+        first="value 1",
+        second=42,
+    )
+
+    # The basic properties have been set.
+    assert config.app_name == "myapp"
+    assert config.version == Version("1.2.3")
+    assert config.bundle == "org.beeware"
+    assert config.description == "A simple app"
+    assert config.long_description == "A longer description\nof the app"
+    assert config.template == "/path/to/template"
+    assert config.requires == ["first", "second", "third"]
+    assert config.license == "MIT"
+    assert config.license_files == ["LICENSE"]
+    assert config.env_manager == "venv"
+
+    # Properties that are derived by default have been set explicitly
+    assert config.formal_name == "My App!"
+    assert config.class_name == "MyApp"
+
+    if sys.platform == "darwin":
+        assert config.document_types == {
+            "document": {
+                "icon": "icon",
+                "extension": "doc",
+                "description": "A document",
+                "url": "https://testurl.com",
+                "mime_type": "application/x-my-doc-type",
+                "macOS": {
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Owner",
+                    "UTTypeConformsTo": [
+                        "public.data",
+                        "public.content",
+                    ],
+                    "is_core_type": False,
+                },
+            }
+        }
+    else:
+        assert config.document_types == {
+            "document": {
+                "icon": "icon",
+                "extension": "doc",
+                "description": "A document",
+                "url": "https://testurl.com",
+                "mime_type": "application/x-my-doc-type",
+            }
+        }
+
+    # Explicit additional properties have been set
+    assert config.first == "value 1"
+    assert config.second == 42
+
+    # An attribute that wasn't provided raises an error
+    with pytest.raises(AttributeError):
+        _ = config.unknown
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "myapp",  # lowercase
+        "myApp",  # contains uppercase
+        "MyApp",  # initial uppercase
+        "MyAPP",  # ends in uppercase
+        "my-app",  # contains hyphen
+        "my_app",  # contains underscore
+        "myapp2",  # ends with digit
+        "my2app",  # contains digit
+    ],
+)
+def test_valid_app_name(name):
+    try:
+        DraftAppConfig(
+            app_name=name,
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            sources=["src/" + name.replace("-", "_")],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+    except BriefcaseConfigError:
+        pytest.fail(f"{name} should be valid")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "!myapp",  # initial punctuation
+        "my!app",  # contains punctuation
+        "myapp!",  # end punctuation
+        "my$app",  # other punctuation
+        "-myApp",  # initial hyphen
+        "myApp-",  # end hyphen
+        "_myApp",  # initial underscore
+        "myApp_",  # end underscore
+        "2myApp",  # leading digit
+    ],
+)
+def test_invalid_app_name(name):
+    with pytest.raises(BriefcaseConfigError, match=r"is not a valid app name\."):
+        DraftAppConfig(
+            app_name=name,
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            sources=["src/invalid"],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("bundle", "app_name", "bundle_identifier"),
+    [
+        ("is", "myapp", "is.myapp"),
+        ("home", "myapp", "home.myapp"),
+        ("home", "my-app", "home.my-app"),
+        ("home", "my_app", "home.my-app"),
+        ("com.example", "myapp", "com.example.myapp"),
+        ("com.example", "my-app", "com.example.my-app"),
+        ("com.example", "my_app", "com.example.my-app"),
+        ("com.example.more", "myapp", "com.example.more.myapp"),
+        ("com.example42.more", "myapp", "com.example42.more.myapp"),
+        ("com.example-42.more", "myapp", "com.example-42.more.myapp"),
+    ],
+)
+def test_valid_bundle(bundle, app_name, bundle_identifier):
+    try:
+        config = DraftAppConfig(
+            app_name=app_name,
+            version="1.2.3",
+            bundle=bundle,
+            description="A simple app",
+            sources=[f"src/{app_name.replace('-', '_')}"],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+    except BriefcaseConfigError:
+        pytest.fail(f"{bundle_identifier} should be valid")
+
+    assert config.bundle_identifier == bundle_identifier
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        "not a bundle!",  # Free text.
+        "com.hello_world",  # underscore
+        "com.hello,world",  # comma
+        "com.hello world!",  # exclamation point
+    ],
+)
+def test_invalid_bundle_identifier(bundle):
+    with pytest.raises(
+        BriefcaseConfigError, match=r"is not a valid bundle identifier\."
+    ):
+        DraftAppConfig(
+            app_name="myapp",
+            version="1.2.3",
+            bundle=bundle,
+            description="A simple app",
+            sources=["src/invalid"],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+
+
+@pytest.mark.parametrize(("input", "expected"), VALID_VERSIONS)
+def test_valid_app_version(input, expected):
+    config = DraftAppConfig(
+        app_name="myapp",
+        version=input,
+        bundle="org.beeware",
+        description="A simple app",
+        sources=["src/myapp"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    # Version is parsed as an equivalent Version object
+    assert config.version == Version(expected)
+    # Serialized output of parsed Version matches the expected value
+    assert str(config.version) == expected
+
+
+@pytest.mark.parametrize("input", INVALID_VERSIONS)
+def test_invalid_app_version(input):
+    with pytest.raises(
+        BriefcaseConfigError,
+        match=rf"Version number for 'myapp' \({input}\) is not valid\.",
+    ):
+        DraftAppConfig(
+            app_name="myapp",
+            version=input,
+            bundle="org.beeware",
+            description="A simple app",
+            sources=["src/invalid"],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "module_name"),
+    [
+        ("myapp", "myapp"),
+        ("my-app", "my_app"),
+    ],
+)
+def test_module_name(name, module_name):
+    config = DraftAppConfig(
+        app_name=name,
+        version="1.2.3",
+        bundle="org.beeware",
+        description="A simple app",
+        sources=["src/" + module_name],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    assert config.module_name == module_name
+
+
+@pytest.mark.parametrize(
+    ("bundle", "package_name"),
+    [
+        ("com.example", "com.example"),
+        ("com.ex-ample", "com.ex_ample"),
+    ],
+)
+def test_package_name(bundle, package_name):
+    config = DraftAppConfig(
+        app_name="myapp",
+        version="1.2.3",
+        bundle=bundle,
+        description="A simple app",
+        sources=["src/myapp"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    assert config.package_name == package_name
+
+
+@pytest.mark.parametrize(
+    ("app_name", "dist_info_name"),
+    [
+        ("my-app", "my_app.dist-info"),
+        ("my_app", "my_app.dist-info"),
+    ],
+)
+def test_dist_info_name(app_name, dist_info_name):
+    config = DraftAppConfig(
+        app_name=app_name,
+        version="1.2.3",
+        bundle="com.example",
+        description="A simple app",
+        sources=["src/my_app"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    assert config.dist_info_name == dist_info_name
+
+
+@pytest.mark.parametrize(
+    ("app_name", "bundle_name"),
+    [
+        ("my-app", "my-app"),
+        ("my_app", "my-app"),
+    ],
+)
+def test_bundle_name(app_name, bundle_name):
+    config = DraftAppConfig(
+        app_name=app_name,
+        version="1.2.3",
+        bundle="com.example",
+        description="A simple app",
+        sources=["src/my_app"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    assert config.bundle_name == bundle_name
+
+
+@pytest.mark.parametrize(
+    ("app_name", "bundle_name"),
+    [
+        ("my-app", "my-app"),
+        ("my_app", "my-app"),
+    ],
+)
+def test_bundle_identifier(app_name, bundle_name):
+    bundle = "com.example"
+
+    config = DraftAppConfig(
+        app_name=app_name,
+        version="1.2.3",
+        bundle=bundle,
+        description="A simple app",
+        sources=["src/my_app"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    assert config.bundle_identifier == f"{bundle}.{bundle_name}"
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        ["src/dupe", "src/dupe"],
+        ["src/dupe", "src/other", "src/dupe"],
+        ["src/dupe", "somewhere/dupe", "src/other"],
+        ["src/dupe", "src/deep/dupe", "src/other"],
+    ],
+)
+def test_duplicated_source(sources):
+    with pytest.raises(
+        BriefcaseConfigError, match=r"contains duplicated package names\."
+    ):
+        DraftAppConfig(
+            app_name="dupe",
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            sources=sources,
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+
+
+def test_no_source_for_app():
+    with pytest.raises(
+        BriefcaseConfigError, match=r" does not include a package named 'my_app'\."
+    ):
+        DraftAppConfig(
+            app_name="my-app",
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            sources=["src/something", "src/other"],
+            license="MIT",
+            license_files=["LICENSE"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("install_launcher", "console_app", "expected"),
+    [
+        (True, False, True),
+        (False, False, False),
+        (None, False, True),
+        (True, True, True),
+        (False, True, False),
+        (None, True, False),
+    ],
+)
+def test_install_launcher(install_launcher, console_app, expected):
+    config = DraftAppConfig(
+        app_name="my-app",
+        version="1.2.3",
+        bundle="org.beeware",
+        description="A simple app",
+        license="MIT",
+        license_files=["LICENSE"],
+        install_launcher=install_launcher,
+        console_app=console_app,
+    )
+    assert config.install_launcher == expected
+
+
+def test_non_unique_uninstall_options():
+    """Installer and Uninstaller options must not overlap."""
+    with pytest.raises(
+        BriefcaseConfigError,
+        match=(
+            r"Uininstall option names must be unique. "
+            r"The name 'first' is already used as an install option."
+        ),
+    ):
+        DraftAppConfig(
+            app_name="myapp",
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            sources=["src/myapp"],
+            license="MIT",
+            license_files=["LICENSE"],
+            install_option=[
+                {
+                    "name": "first",
+                    "title": "First option",
+                    "description": "Do the first thing",
+                    "default": True,
+                },
+                {
+                    "name": "second",
+                    "title": "Second option",
+                    "description": "Do the second thing",
+                    "default": False,
+                },
+            ],
+            uninstall_option=[
+                {
+                    "name": "first",
+                    "title": "First option",
+                    "description": "Do the first thing",
+                    "default": True,
+                },
+            ],
+        )
+
+
+def test_capitalization():
+    """Capitalization is prohibited and normalized out in some properties."""
+    config = DraftAppConfig(
+        app_name="MyApp",
+        version="1.2.3",
+        bundle="Org.Beeware",
+        description="A simple app",
+        sources=["src/MyApp", "somewhere/else/interesting", "local_app"],
+        license="MIT",
+        license_files=["LICENSE"],
+    )
+
+    # The basic properties have been set.
+    assert config.app_name == "MyApp"
+    assert config.bundle == "org.beeware"
+
+    # Derived properties have been set.
+    assert config.bundle_name == "myapp"
+    assert config.bundle_identifier == "org.beeware.myapp"
+    assert config.formal_name == "MyApp"
+    assert config.class_name == "MyApp"
+
+    # The object has a meaningful REPL
+    assert repr(config) == "<org.beeware.myapp v1.2.3 DraftAppConfig>"
+
+
+def test_unknown_env_manager():
+    with pytest.raises(
+        BriefcaseConfigError,
+        match=r"Unknown environment manager 'unknown'",
+    ):
+        DraftAppConfig(
+            app_name="bad-env-manager",
+            version="1.2.3",
+            bundle="org.beeware",
+            description="A simple app",
+            license="MIT",
+            license_files=["LICENSE"],
+            env_manager="unknown",
+        )

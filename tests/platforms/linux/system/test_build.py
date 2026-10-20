@@ -1,0 +1,261 @@
+import gzip
+import os
+import subprocess
+import sys
+from unittest import mock
+
+import pytest
+
+from briefcase.exceptions import BriefcaseCommandError
+from briefcase.platforms.linux.system import LinuxSystemBuildCommand
+
+from ....utils import create_file
+
+
+@pytest.fixture
+def build_command(dummy_console, tmp_path, first_app):
+    command = LinuxSystemBuildCommand(
+        console=dummy_console,
+        base_path=tmp_path / "base_path",
+        data_path=tmp_path / "briefcase",
+        apps={"first": first_app},
+    )
+    command.tools.host_os = "Linux"
+    command.tools.host_arch = "wonky"
+
+    # Mock subprocess
+    command.tools.subprocess = mock.MagicMock()
+
+    # Mock the app context
+    command.tools.app_tools[first_app].app_context = mock.MagicMock()
+
+    return command
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Can't build Linux apps on Windows")
+def test_build_app(build_command, first_app, tmp_path):
+    """An app can be built as a deb."""
+    # Build the app
+    build_command.build_app(first_app)
+
+    # The bootstrap binary was compiled
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+    build_command.tools[first_app].app_context.run.assert_called_with(
+        ["make", "-C", "bootstrap", "install"],
+        check=True,
+        cwd=bundle_path,
+    )
+
+    # The license file has been installed
+    doc_path = bundle_path / "first-app-0.0.1/usr/share/doc/first-app"
+    assert (doc_path / "copyright").exists()
+    with (doc_path / "copyright").open(encoding="utf-8") as f:
+        assert f.read() == "The Actual First App License"
+
+    # The Changelog has been compressed and installed
+    assert (doc_path / "changelog.gz").exists()
+    with gzip.open(doc_path / "changelog.gz") as f:
+        assert f.read().decode() == "First App Changelog"
+
+    # The manpage has been installed
+    man_path = bundle_path / "first-app-0.0.1/usr/share/man/man1"
+    assert (man_path / "first-app.1.gz").exists()
+    with gzip.open(man_path / "first-app.1.gz") as f:
+        assert f.read().decode() == "First App manpage"
+
+    # Problematic permissions have been updated
+    lib_dir = bundle_path / "first-app-0.0.1/usr/lib/first-app"
+    # 775 -> 775
+    assert os.stat(lib_dir / "app/support.so").st_mode & 0o777 == 0o755
+    # 664 -> 644
+    assert (
+        os.stat(lib_dir / "app_packages/secondlib/second_a.so").st_mode & 0o777 == 0o644
+    )
+    # no perms change
+    assert os.stat(lib_dir / "app/support_same_perms.so").st_mode & 0o777 == 0o744
+
+    # Strip has been invoked on the binary
+    build_command.tools.subprocess.check_output.assert_called_once_with(
+        [
+            "strip",
+            bundle_path / "first-app-0.0.1/usr/bin/first-app",
+        ]
+    )
+
+
+def test_build_bootstrap_failed(build_command, first_app, tmp_path):
+    """If the bootstrap binary can't be compiled, an error is raised."""
+    # Mock a build failure
+    build_command.tools[
+        first_app
+    ].app_context.run.side_effect = subprocess.CalledProcessError(
+        cmd=["make ..."], returncode=-1
+    )
+
+    # Build the app; it will fail
+    with pytest.raises(
+        BriefcaseCommandError,
+        match=r"Error building bootstrap binary for first-app.",
+    ):
+        build_command.build_app(first_app)
+
+    # An attempt to do the compile occurred.
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+    build_command.tools[first_app].app_context.run.assert_called_with(
+        ["make", "-C", "bootstrap", "install"],
+        check=True,
+        cwd=bundle_path,
+    )
+
+
+def test_no_license_files(build_command, first_app, tmp_path):
+    """If there are no license files, an error is raised."""
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+
+    # Delete the license source
+    first_app.license_files = []
+
+    # Build the app; it will fail
+    with pytest.raises(
+        BriefcaseCommandError,
+        match=r"Your project does not include any license files.",
+    ):
+        build_command.build_app(first_app)
+
+    # The bootstrap binary was compiled
+    build_command.tools[first_app].app_context.run.assert_called_with(
+        ["make", "-C", "bootstrap", "install"],
+        check=True,
+        cwd=bundle_path,
+    )
+
+
+def test_specified_license_file_is_copied(build_command, first_app, tmp_path):
+    """The specified license file is copied if a license file is specified."""
+
+    # Build the app
+    build_command.build_app(first_app)
+
+    # The correct license file has been copied
+    doc_folder = (
+        build_command.bundle_path(first_app)
+        / f"{first_app.app_name}-{first_app.version}"
+        / "usr"
+        / "share"
+        / "doc"
+        / first_app.app_name
+    )
+    assert (doc_folder / "copyright").read_text(
+        encoding="utf-8"
+    ) == "The Actual First App License"
+
+
+def test_multiple_license_files_concatenated(build_command, first_app, tmp_path):
+    """Multiple license files are concatenated with a separator."""
+    create_file(tmp_path / "base_path/LICENSE-A", "License A text")
+    create_file(tmp_path / "base_path/LICENSE-B", "License B text")
+    first_app.license_files = ["LICENSE-A", "LICENSE-B"]
+
+    # Build the app
+    build_command.build_app(first_app)
+
+    doc_folder = (
+        build_command.bundle_path(first_app)
+        / f"{first_app.app_name}-{first_app.version}"
+        / "usr"
+        / "share"
+        / "doc"
+        / first_app.app_name
+    )
+    content = (doc_folder / "copyright").read_text(encoding="utf-8")
+    separator = "-" * 75
+    assert content == f"License A text\n{separator}\nLicense B text"
+
+
+def test_missing_changelog(build_command, first_app, tmp_path):
+    """If the changelog source file is missing, an error is raised."""
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+
+    # Delete the changelog source
+    (tmp_path / "base_path/CHANGELOG").unlink()
+
+    # Build the app; it will fail
+    with pytest.raises(
+        BriefcaseCommandError,
+        match=r"Your project does not contain a changelog file.",
+    ):
+        build_command.build_app(first_app)
+
+    # The bootstrap binary was compiled
+    build_command.tools[first_app].app_context.run.assert_called_with(
+        ["make", "-C", "bootstrap", "install"],
+        check=True,
+        cwd=bundle_path,
+    )
+
+    # The license file has been installed
+    doc_path = bundle_path / "first-app-0.0.1/usr/share/doc/first-app"
+    assert (doc_path / "copyright").exists()
+    with (doc_path / "copyright").open(encoding="utf-8") as f:
+        assert f.read() == "The Actual First App License"
+
+
+def test_missing_manpage(build_command, first_app, tmp_path):
+    """If the manpage source file is missing, an error is raised."""
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+
+    # Delete the manpage source
+    (bundle_path / "first-app.1").unlink()
+
+    # Build the app; it will fail
+    with pytest.raises(
+        BriefcaseCommandError,
+        match=r"Template does not provide a manpage source file `first-app\.1`",
+    ):
+        build_command.build_app(first_app)
+
+    # The bootstrap binary was compiled
+    build_command.tools[first_app].app_context.run.assert_called_with(
+        ["make", "-C", "bootstrap", "install"],
+        check=True,
+        cwd=bundle_path,
+    )
+
+    # The license file has been installed
+    doc_path = bundle_path / "first-app-0.0.1/usr/share/doc/first-app"
+    assert (doc_path / "copyright").exists()
+    with (doc_path / "copyright").open(encoding="utf-8") as f:
+        assert f.read() == "The Actual First App License"
+
+    # The Changelog has been compressed and installed
+    assert (doc_path / "changelog.gz").exists()
+    with gzip.open(doc_path / "changelog.gz") as f:
+        assert f.read().decode() == "First App Changelog"
+
+
+def test_custom_man_page(build_command, first_app, tmp_path):
+    """A custom man page is used when man_page is set in config."""
+    create_file(
+        tmp_path / "base_path/docs/first-app.1",
+        "Custom man page content",
+    )
+    first_app.man_page = "docs/first-app.1"
+
+    build_command.build_app(first_app)
+
+    bundle_path = tmp_path / "base_path/build/first-app/somevendor/surprising"
+    man_path = bundle_path / "first-app-0.0.1/usr/share/man/man1"
+    assert (man_path / "first-app.1.gz").exists()
+    with gzip.open(man_path / "first-app.1.gz") as f:
+        assert f.read().decode() == "Custom man page content"
+
+
+def test_custom_man_page_missing(build_command, first_app, tmp_path):
+    """If a custom man page is specified but doesn't exist, an error is raised."""
+    first_app.man_page = "docs/nonexistent.1"
+
+    with pytest.raises(
+        BriefcaseCommandError,
+        match=r"The man page source file 'docs/nonexistent\.1' does not exist.",
+    ):
+        build_command.build_app(first_app)
