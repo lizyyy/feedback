@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:10.8
+    environment:
+      POSTGRES_USER: username
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: testsuite
+    ports:
+      - 5432:5432
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_USER: username
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: testsuite
+    ports:
+      - 3306:3306
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro

@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pre-commit-local
+        name: format
+        entry: make pre-commit
+        language: python
+        pass_filenames: false
+
