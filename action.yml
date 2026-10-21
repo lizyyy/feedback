@@ -1,0 +1,44 @@
+# This is a definition file for a Github Action.
+# See: https://help.github.com/en/articles/creating-a-docker-container-action
+
+# We also define metadata here:
+# See: https://help.github.com/en/articles/metadata-syntax-for-github-actions
+
+name: 'wemake-python-styleguide'
+description: 'Runs wemake-python-styleguide as a GitHub Action'
+branding:
+  icon: 'check'
+  color: 'green'
+inputs:
+  path:
+    description: 'Path or space-separated list of paths to lint'
+    required: false
+    default: '.'
+  cwd:
+    description: 'Path to `cd` into before linting'
+    required: false
+    default: '.'
+  reporter:
+    description: 'How would you like the results to be displayed?'
+    required: false
+    default: 'terminal'
+  filter_mode:
+    description: 'How to filter found violations? Only used with `github-pr-*` reporters. Docs: https://github.com/reviewdog/reviewdog#filter-mode'
+    required: false
+    default: 'added'
+  fail_workflow:
+    description: 'Should we fail the workflow if the check does not pass?'
+    required: false
+    default: '1'
+outputs:
+  output:
+    description: 'The output of wemake-python-styleguide run'
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.path }}
+    - ${{ inputs.cwd }}
+    - ${{ inputs.reporter }}
+    - ${{ inputs.filter_mode }}
+    - ${{ inputs.fail_workflow }}

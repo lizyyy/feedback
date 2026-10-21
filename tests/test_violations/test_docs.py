@@ -1,0 +1,48 @@
+from wemake_python_styleguide.options.config import Configuration
+
+FORMATTING_OPTIONS = frozenset(('--show-violation-links',))
+
+
+def test_all_violations_have_versionadded(all_violations):
+    """Ensures that all violations have `versionadded` tag."""
+    for violation in all_violations:
+        assert '.. versionadded:: ' in violation.__doc__
+
+
+def test_violation_name(all_violations):
+    """Ensures that all violations have `Violation` suffix."""
+    for violation in all_violations:
+        class_name = violation.__qualname__
+        assert class_name.endswith('Violation'), class_name
+
+
+def test_violation_template_ending(all_violations):
+    """Ensures that all violation templates do not end with a dot."""
+    for violation in all_violations:
+        assert not violation.error_template.endswith('.'), violation
+
+
+def test_configuration(all_violations):
+    """Ensures that all configuration options are listed in the docs."""
+    option_listed = {
+        option.long_option_name: False
+        for option in Configuration._options  # noqa: SLF001
+        if option.long_option_name not in FORMATTING_OPTIONS
+    }
+
+    for violation in all_violations:
+        for listed in option_listed:
+            if listed in violation.__doc__:
+                option_listed[listed] = True
+
+                assert 'Configuration:' in violation.__doc__
+                assert 'Default:' in violation.__doc__
+
+    for option_item, is_listed in option_listed.items():
+        assert is_listed, option_item
+
+
+def test_all_violations_doc_start_with_full_code(all_violations):
+    """Ensures that all violations have `versionadded` tag."""
+    for violation in all_violations:
+        assert violation.__doc__.lstrip().startswith(violation.full_code)
