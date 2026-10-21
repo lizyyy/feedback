@@ -1,0 +1,128 @@
+---
+# 0.5 - API
+# 2 - Release
+# 3 - Contributing
+# 5 - Template Page
+# 10 - Default
+description: >-
+  Publish messages from FastStream with broker.publish, the publisher decorator or a reusable
+  publisher object — in an application or as a plain client.
+search:
+  boost: 10
+---
+
+# Publishing Basics
+
+**FastStream** is broker-agnostic and easy to use, even as a client in non-**FastStream** applications.
+
+It offers several use cases for publishing messages:
+
+* Using [`#!python broker.publish(...)` method](./broker.md){.internal-link}
+* Using the [`#!python @broker.publisher(...)` decorator](./decorator.md){.internal-link}
+* Using a [publisher object decorator](./object.md){.internal-link}
+* Using a [publisher object directly](./direct.md){.internal-link}
+
+All of these variants have their own advantages and limitations, so you can choose what you want based on your requirements. This section will guide you through all the details.
+
+## Serialization
+
+**FastStream** allows you to publish any JSON-serializable messages (Python types, Pydantic models, etc.) or raw bytes.
+
+It automatically sets up all required headers, especially the `correlation_id`, which is used to trace message processing pipelines across all services.
+
+The `content-type` is a meaningful header for **FastStream** services. It helps the framework serialize messages faster, selecting the right serializer based on the header. This header is automatically set by **FastStream** too, but you should set it up manually using other libraries to interact with **FastStream** applications.
+
+Content-Type can be:
+
+* `text/plain`
+* `application/json`
+* empty with bytes content
+
+By the way, you can use `application/json` for all of your messages if they are not raw bytes. You can even omit using any header at all, but it makes serialization slightly slower.
+
+### Raw Bytes
+
+`bytes` are the one payload **FastStream** doesn't touch: the body is sent as-is and **no content type is set**, because the framework can't know what those bytes are (**Kafka** and **NATS** send an empty `content-type` header, the other brokers send none). The same applies to a `#!python @broker.publisher(...)` handler that returns `bytes`.
+
+```python
+await broker.publish(b"\x89PNG...", "images")
+```
+
+If the consumer needs to know the format, say so yourself through the message headers:
+
+```python
+await broker.publish(
+    b"\x89PNG...",
+    "images",
+    headers={"content-type": "image/png"},
+)
+```
+
+**RabbitMQ** carries the content type as an AMQP message property instead of a header, so `RabbitBroker` and its publishers take it as a dedicated `content_type` argument:
+
+```python
+await broker.publish(b"\x89PNG...", "images", content_type="image/png")
+```
+
+**MQTT** keeps the content type in a message property as well, and `MQTTBroker` has no argument to set it yet: a `content-type` entry in `headers` becomes a plain user property, so the consumer gets the bytes without a content type.
+
+On the receiving side, a handler annotated with `#!python body: bytes` gets the raw payload in both cases. Without a `content-type` header **FastStream** first tries to parse the body as JSON and falls back to the raw bytes if that fails, and with an unknown one (anything but `text/plain` and `application/json`) it hands the bytes over untouched.
+
+## Correlation ID
+
+By default, **FastStream** generates a random UUID4 string for `correlation_id` whenever a `#!python publish(...)`/`#!python request(...)` call doesn't set one explicitly.
+
+You can replace this generator for the whole broker by passing `id_generator` when creating it. This is handy, for example, to use [ULIDs](https://github.com/ulid/spec){.external-link target="_blank"} instead of UUIDs, since they are lexicographically sortable by creation time:
+
+```python
+from faststream.kafka import KafkaBroker
+from ulid import ULID
+
+broker = KafkaBroker(id_generator=lambda: str(ULID()))
+```
+
+This works the same way for every broker's constructor (`#!python RabbitBroker(id_generator=...)`, `#!python NatsBroker(id_generator=...)`, etc.).
+
+## Publishing
+
+**FastStream** can also be used as a Broker client to send messages in other applications.
+
+You just need to `#!python connect` your broker, and you are ready to send a message. Additionally, you can use *Broker* as an async context manager to establish a connection and disconnect when leaving the scope.
+
+To publish a message, provide the message content and a routing key:
+
+=== "AIOKafka"
+    ```python
+    async with KafkaBroker() as br:
+        await br.publish("message", "topic")
+    ```
+
+=== "Confluent"
+    ```python
+    async with KafkaBroker() as br:
+        await br.publish("message", "topic")
+    ```
+
+=== "RabbitMQ"
+    ```python
+    async with RabbitBroker() as br:
+        await br.publish("message", "queue")
+    ```
+
+=== "NATS"
+    ```python
+    async with NatsBroker() as br:
+        await br.publish("message", "subject")
+    ```
+
+=== "Redis"
+    ```python
+    async with RedisBroker() as br:
+        await br.publish("message", "channel")
+    ```
+
+=== "MQTT"
+    ```python
+    async with MQTTBroker("localhost", port=1883) as br:
+        await br.publish("message", "topic")
+    ```

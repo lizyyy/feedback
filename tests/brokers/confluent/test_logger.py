@@ -1,0 +1,31 @@
+import logging
+from typing import Any
+
+import pytest
+
+from .basic import ConfluentTestcaseConfig
+
+
+@pytest.mark.connected()
+@pytest.mark.confluent()
+class TestLogger(ConfluentTestcaseConfig):
+    """A class to represent a test Kafka broker."""
+
+    @pytest.mark.asyncio()
+    async def test_custom_logger(self, queue: str) -> None:
+        test_logger = logging.getLogger("test_logger")
+        broker = self.get_broker(logger=test_logger)
+
+        args, kwargs = self.get_subscriber_params(queue)
+
+        @broker.subscriber(*args, **kwargs)  # type: ignore[untyped-decorator]
+        def subscriber(m: Any) -> None: ...
+
+        await broker.start()
+
+        subscribers: list[Any] = broker.subscribers
+        for sub in subscribers:
+            consumer_logger = sub.consumer.logger_state.logger.logger
+            assert consumer_logger == test_logger
+
+        await broker.stop()
