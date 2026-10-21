@@ -1,0 +1,26 @@
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+docs/_build/
+build/
+.doctrees/
+.vscode/
+piccolo.egg-info/
+.idea/
+dist/
+piccolo.sqlite
+_build/
+.coverage
+coverage.xml
+*.sqlite
+htmlcov/
+prof/
+.env/
+.venv/
+result.json
+
+# CockroachDB
+cockroach-data/
+heap_profiler/
+goroutine_dump/
